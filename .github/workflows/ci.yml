@@ -16,9 +16,9 @@ concurrency:
 jobs:
   build-test-coverage:
     name: build · test · 100% coverage
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Swift toolchain
         run: swift --version
