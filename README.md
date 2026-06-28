@@ -119,11 +119,11 @@ TUI — nothing to install, and nothing between you and the raw advert bytes.
 ## Install
 
 ```sh
-make            # build + sign the optimised `blescan` binary into ~/.bin
-make clean      # remove it
+make install    # build + sign the optimised `blescan` binary into ~/.bin
+make uninstall  # remove it
 ```
 
-`make` compiles an optimised, fully‑stripped binary (no debug info), **embeds the
+`make install` compiles an optimised, fully‑stripped binary (no debug info), **embeds the
 `Info.plist`** into the Mach‑O (so a bundle‑less CLI can still request Bluetooth — see
 [below](#how-the-permission-prompt-works-no-app-bundle)), ad‑hoc code‑signs it, and drops
 a **`blescan`** command into **`~/.bin`**.
@@ -145,7 +145,7 @@ prompts; click **Allow**. If you miss it:
 
 ### Keep the grant across rebuilds (optional)
 
-Ad‑hoc signing gives the binary a new identity on every `make`, so macOS forgets the
+Ad‑hoc signing gives the binary a new identity on every `make install`, so macOS forgets the
 grant and re‑prompts. To make it **stick across rebuilds**, sign with a stable
 self‑signed certificate:
 
@@ -156,9 +156,9 @@ self‑signed certificate:
    ```make
    SIGN := blescan-codesign
    ```
-3. `make` now signs with that identity. Grant Bluetooth once; every future build keeps it.
+3. `make install` now signs with that identity. Grant Bluetooth once; every future build keeps it.
 
-(The public repo defaults to ad‑hoc signing, so `make` works for everyone with no setup.)
+(The public repo defaults to ad‑hoc signing, so `make install` works for everyone with no setup.)
 
 ## Usage
 
@@ -261,12 +261,17 @@ All of this lives in the framework‑free `Core.swift`, unit‑tested at **100% 
 ## JSON output
 
 `blescan --json` scans for a few seconds and prints a pretty array (sorted by RSSI,
-strongest first; keys alphabetised). Fields that aren't advertised are omitted:
+strongest first; keys alphabetised). Fields that aren't advertised are omitted — beacons
+add structured `iBeacon` / `eddystone` fields, `serviceData` carries the raw hex of each
+service‑data entry, `companyId` is the raw `0xXXXX`, and `rssi` is dropped when the radio
+reports it unavailable:
 
 ```jsonc
 [
   {
+    "companyId": "0x004C",
     "connectable": true,
+    "continuity": ["AirPods / Proximity Pairing"],
     "id": "B6F5B1C0-1A2B-3C4D-5E6F-9A21C5D4E3F2",
     "manufacturerHex": "4c000719...",
     "name": "Lucas’ AirPods",
@@ -327,7 +332,7 @@ under the binary's name — no `.app` wrapper, no Apple Developer account, no sp
 entitlement. (This is the BLE analogue of how
 [macos‑wifi‑scan](https://github.com/lucasdaddiego/macos-wifi-scan) ships an Info.plist
 for its **Location** requirement — different permission, same embed trick.) Because the
-ad‑hoc signature changes every build, the grant resets on each `make`; sign with a
+ad‑hoc signature changes every build, the grant resets on each `make install`; sign with a
 [stable cert](#keep-the-grant-across-rebuilds-optional) to keep it.
 
 ## Architecture
@@ -351,7 +356,8 @@ ad‑hoc signature changes every build, the grant resets on each `make`; sign wi
   needed (BLE has no SSID‑redaction quirk to work around).
 - **App** (`main.swift`): the live device table, history ring buffers, UI state, and the
   raw‑mode ANSI renderer (master table + detail pane), painted with synchronized output
-  and frame‑diffing so it never tears and idles at ~0% CPU.
+  and frame‑diffing so it never tears. It idles at near‑0% CPU when the radio is quiet; while
+  actively scanning it does a light ~10 fps redraw to animate the spinner and signal trace.
 - **Core** (`Core.swift`): all the pure logic — vendor/service/beacon fingerprinting, the
   proximity model, colour, sorting, hex dump and display‑width‑aware text layout —
   framework‑free and unit‑tested at 100%.
@@ -365,8 +371,8 @@ Tests/CoreTests.swift        dependency-free unit tests for Core (`make test`, 1
 scripts/check-coverage.sh    coverage gate — fails unless Core.swift is 100% region+line covered
 .github/workflows/ci.yml     GitHub Actions: build + test + coverage gate on every push/PR
 Info.plist                   Bluetooth usage string, embedded into the binary at link time
-Makefile                     `make` → signed blescan in ~/.bin; `make test` / `make coverage`
-Package.swift                SwiftPM manifest (for editors/tooling/CI; `make` uses swiftc)
+Makefile                     `make install` → signed blescan in ~/.bin; `make test` / `make coverage`
+Package.swift                SwiftPM manifest (for editors/tooling/CI; the Makefile uses swiftc)
 Makefile.local               optional, git-ignored: machine-local SIGN identity
 ```
 
@@ -376,12 +382,13 @@ frameworks.
 ## Development
 
 ```sh
-make                       # build + sign + install (≡ make install)
+make                       # list targets (default; ≡ make help)
+make install               # build + sign + install into ~/.bin
+make build                 # build + sign ./blescan locally, no install (quick compile)
+make run ARGS=--diag       # build, then run ./blescan with flags (≡ make diag)
 make test                  # run the core unit tests (no Xcode/XCTest needed — CLT only)
 make coverage              # run tests under llvm-cov; fails unless Core.swift is 100% covered
-swiftc Sources/blescan/Core.swift Sources/blescan/main.swift -o /tmp/blescan \
-    -framework CoreBluetooth          # quick type-check / compile
-blescan --diag             # verify scanning + permission
+make clean                 # remove build artifacts (make uninstall removes ~/.bin/blescan)
 ```
 
 Two files: **`Core.swift`** holds the pure, framework‑free logic (fingerprinting,

@@ -57,6 +57,7 @@ let ibeaconBytes: [UInt8] =
         testBars()
         testAge()
         testLayout()
+        testFittingVariant()
         testSanitize()
         testDevice()
 
@@ -332,6 +333,9 @@ let ibeaconBytes: [UInt8] =
         let long = hexDump(Array(0..<20).map { UInt8($0) })
         eq(long.count, 2, "20 bytes → 2 rows")
         ok(long[1].hasPrefix("0010"), "second row offset = 0x10")
+        // The short final row keeps the hex field's full width, so the |ascii| column
+        // lines up with the full row above it (regression: a trim used to break this).
+        eq(long[0].firstIndex(of: "|"), long[1].firstIndex(of: "|"), "ascii column aligns across rows")
     }
 
     // MARK: Signal colour
@@ -397,6 +401,7 @@ let ibeaconBytes: [UInt8] =
         eq(charDisplayWidth("A"), 1, "ascii → 1")
         eq(charDisplayWidth("你"), 2, "CJK → 2")
         eq(charDisplayWidth("😀"), 2, "emoji → 2")
+        eq(charDisplayWidth("🇬🇧"), 2, "flag emoji (regional indicators) → 2")
 
         eq(displayWidth("a你"), 3, "mixed display width")
         eq(padTo("ab", 4), "ab  ", "padTo pads right")
@@ -405,6 +410,16 @@ let ibeaconBytes: [UInt8] =
         eq(padLeft("ab", 4), "  ab", "padLeft pads left")
         eq(padLeft("hello", 3), "hel", "padLeft truncates")
         eq(displayWidth(padLeft("你好", 3)), 3, "padLeft truncates wide without overflow")
+    }
+
+    // MARK: Width-fitting variant selection
+
+    static func testFittingVariant() {
+        let v = ["richest", "mid", "x"]   // display widths 7 / 3 / 1, richest first
+        eq(widthFittingVariant(v, 99), "richest", "widest fits → richest variant")
+        eq(widthFittingVariant(v, 5), "mid", "richest too wide → next that fits")
+        eq(widthFittingVariant(v, 0), "x", "none fit → narrowest as floor")
+        eq(widthFittingVariant([], 5), "", "no variants → empty string")
     }
 
     // MARK: Terminal-safe names
@@ -417,6 +432,13 @@ let ibeaconBytes: [UInt8] =
         eq(sanitizeName("a\tb\nc\rd"), "a·b·c·d", "TAB/LF/CR neutralised")
         eq(sanitizeName("x\u{7F}y"), "x·y", "DEL neutralised")
         eq(sanitizeName("x\u{85}y"), "x·y", "C1 control neutralised")
+        eq(sanitizeName("x\u{061C}y"), "x·y", "Arabic letter mark neutralised")
+        eq(sanitizeName("x\u{200B}y"), "x·y", "zero-width space neutralised")
+        eq(sanitizeName("x\u{200E}y"), "x·y", "LRM neutralised")
+        eq(sanitizeName("x\u{2028}y"), "x·y", "line separator neutralised")
+        eq(sanitizeName("evil\u{202E}txet.gpj"), "evil·txet.gpj", "RTL override neutralised")
+        eq(sanitizeName("x\u{2066}y"), "x·y", "bidi isolate neutralised")
+        eq(sanitizeName("x\u{FEFF}y"), "x·y", "BOM neutralised")
         eq(displayWidth(sanitizeName("a\u{1B}\u{7F}b")), 4, "sanitised name keeps width")
     }
 

@@ -437,7 +437,10 @@ func hexDump(_ bytes: [UInt8], width: Int = 16) -> [String] {
             hex += i < slice.count ? String(format: "%02x ", slice[i]) : "   "
         }
         let ascii = slice.map { (0x20...0x7E).contains($0) ? Character(UnicodeScalar($0)) : "." }
-        rows.append(String(format: "%04x  %@ |%@|", offset, hex.trimmingCharacters(in: .whitespaces), String(ascii)))
+        // Drop only the single trailing space the loop always appends — the per-byte
+        // padding ("   " for absent bytes) is kept, so the hex field is a constant width
+        // and the |ascii| column lines up on every row (incl. a short final row).
+        rows.append(String(format: "%04x  %@ |%@|", offset, String(hex.dropLast()), String(ascii)))
         offset += width
     }
     return rows
@@ -546,7 +549,8 @@ func charDisplayWidth(_ c: Character) -> Int {
         0x1100...0x115F, 0x2329...0x232A, 0x2E80...0x303E, 0x3041...0x33FF,
         0x3400...0x4DBF, 0x4E00...0x9FFF, 0xA000...0xA4CF, 0xAC00...0xD7A3,
         0xF900...0xFAFF, 0xFE10...0xFE19, 0xFE30...0xFE6F, 0xFF00...0xFF60,
-        0xFFE0...0xFFE6, 0x1F300...0x1FAFF, 0x1F900...0x1F9FF, 0x20000...0x3FFFD,
+        0xFFE0...0xFFE6, 0x1F1E6...0x1F1FF, 0x1F300...0x1FAFF, 0x1F900...0x1F9FF,
+        0x20000...0x3FFFD,
     ]
     for r in wide where r.contains(v) { return 2 }
     return 1
@@ -581,6 +585,13 @@ func padLeft(_ s: String, _ n: Int) -> String {
     return String(repeating: " ", count: max(0, n - displayWidth(t))) + t
 }
 
+/// From `variants` ordered richest-first, the first whose display width fits `n` columns,
+/// else the last (narrowest) as a floor — the caller clips that if even it overflows. Lets
+/// a single-line hint shed detail as the terminal narrows instead of truncating mid-word.
+func widthFittingVariant(_ variants: [String], _ n: Int) -> String {
+    variants.first { displayWidth($0) <= n } ?? variants.last ?? ""
+}
+
 // MARK: - Terminal-safe name display
 //
 // A BLE local name is arbitrary bytes — a hostile device can name itself with ANSI escape
@@ -589,15 +600,24 @@ func padLeft(_ s: String, _ n: Int) -> String {
 // sanitizeName before it reaches the screen. (JSON output keeps the raw name: JSONEncoder
 // escapes control bytes, so the JSON stays valid and inert until a consumer renders it.)
 
-/// Replace C0 controls (incl. ESC, CR, LF, TAB), DEL and C1 controls with a visible
-/// middle-dot placeholder, width-preserving so columns stay aligned. Printable text
-/// (including CJK/emoji names) passes through untouched.
+/// Replace anything that can move the cursor, recolour/clear the terminal, OR visually
+/// reorder/hide text with a visible middle-dot placeholder: C0 controls (incl. ESC, CR,
+/// LF, TAB), DEL, C1 controls, the Unicode bidi controls (embeddings/overrides/isolates +
+/// LRM/RLM/ALM), the zero-width formatters (ZWSP/ZW(N)J/BOM) and the line/paragraph
+/// separators. A hostile BLE name is arbitrary bytes, so all of these are surfaced rather
+/// than rendered. Printable text (including CJK/emoji names) passes through untouched.
 func sanitizeName(_ s: String) -> String {
     let placeholder: Unicode.Scalar = "\u{00B7}"   // ·
     var out = String.UnicodeScalarView()
     for scalar in s.unicodeScalars {
         let v = scalar.value
-        out.append(v < 0x20 || v == 0x7F || (0x80...0x9F).contains(v) ? placeholder : scalar)
+        let bad = v < 0x20 || v == 0x7F || (0x80...0x9F).contains(v)   // C0, DEL, C1
+            || v == 0x061C                          // Arabic letter mark
+            || (0x200B...0x200F).contains(v)        // ZWSP/ZWNJ/ZWJ + LRM/RLM
+            || (0x2028...0x202E).contains(v)        // line/para separators + bidi embed/override
+            || (0x2066...0x2069).contains(v)        // bidi isolates
+            || v == 0xFEFF                          // ZWNBSP / BOM
+        out.append(bad ? placeholder : scalar)
     }
     return String(out)
 }
