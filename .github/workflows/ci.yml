@@ -16,7 +16,7 @@ concurrency:
 jobs:
   build-test-coverage:
     name: build · test · 100% coverage
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
 
