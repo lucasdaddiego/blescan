@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.lucasdaddiego.blescan</string>
+    <key>CFBundleName</key>
+    <string>blescan</string>
+    <key>CFBundleDisplayName</key>
+    <string>blescan</string>
+    <key>CFBundleExecutable</key>
+    <string>blescan</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <!-- macOS gates Bluetooth (incl. BLE scanning) behind a TCC permission; this is
+         the prompt text. CoreBluetooth requires NSBluetoothAlwaysUsageDescription —
+         the legacy NSBluetoothPeripheralUsageDescription is deprecated. This plist is
+         embedded into the bare binary at link time (-sectcreate __TEXT __info_plist),
+         so a CLI with no .app bundle still gets the prompt and a TCC identity. -->
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>blescan reads nearby Bluetooth Low Energy advertisements (device names, services and signal strength), which macOS gates behind the Bluetooth permission.</string>
+</dict>
+</plist>
