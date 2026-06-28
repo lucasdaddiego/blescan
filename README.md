@@ -5,10 +5,18 @@
 # blescan
 
 [![CI](https://github.com/lucasdaddiego/blescan/actions/workflows/ci.yml/badge.svg)](https://github.com/lucasdaddiego/blescan/actions/workflows/ci.yml)
+![coverage](https://img.shields.io/badge/coverage-100%25-brightgreen?logo=swift&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-macOS%2012%2B-black?logo=apple)
-![language](https://img.shields.io/badge/Swift-5.9%2B-orange?logo=swift)
+![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange?logo=swift&logoColor=white)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![license](https://img.shields.io/badge/license-MIT-blue)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![last commit](https://img.shields.io/github/last-commit/lucasdaddiego/blescan?logo=git&logoColor=white)](https://github.com/lucasdaddiego/blescan/commits/master)
+![code size](https://img.shields.io/github/languages/code-size/lucasdaddiego/blescan?logo=swift&logoColor=white)
+![repo size](https://img.shields.io/github/repo-size/lucasdaddiego/blescan)
+![top language](https://img.shields.io/github/languages/top/lucasdaddiego/blescan?logo=swift&logoColor=white)
+[![open issues](https://img.shields.io/github/issues/lucasdaddiego/blescan?logo=github)](https://github.com/lucasdaddiego/blescan/issues)
+[![stars](https://img.shields.io/github/stars/lucasdaddiego/blescan?logo=github)](https://github.com/lucasdaddiego/blescan/stargazers)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/lucasdaddiego/blescan/pulls)
 
 A live terminal scanner that finds and **fingerprints every Bluetooth Low Energy device
 around you** — vendor, device‑type guess, advertised services, and a live signal trace —
