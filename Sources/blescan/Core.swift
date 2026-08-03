@@ -545,6 +545,13 @@ func charDisplayWidth(_ c: Character) -> Int {
     let v = c.unicodeScalars.first!.value
     if v == 0 { return 0 }
     if (0x0300...0x036F).contains(v) || (0x200B...0x200F).contains(v) || v == 0xFEFF { return 0 }
+    // Measure the whole cluster, not just its base scalar: an emoji-presentation selector
+    // (VS16, U+FE0F) or an enclosing keycap mark (U+20E3) promotes a narrow base to a
+    // two-cell emoji glyph — "❤️" is U+2764 (narrow) + VS16, "1️⃣" is "1" + VS16 + keycap.
+    // Reading only the first scalar reported those as 1 column while terminals paint 2, so
+    // a name built from them overran the row budget and wrapped, tearing the frame. VS15
+    // (U+FE0E, text presentation) is deliberately absent: it keeps the glyph narrow.
+    if c.unicodeScalars.contains(where: { $0.value == 0xFE0F || $0.value == 0x20E3 }) { return 2 }
     let wide: [ClosedRange<UInt32>] = [
         0x1100...0x115F, 0x2329...0x232A, 0x2E80...0x303E, 0x3041...0x33FF,
         0x3400...0x4DBF, 0x4E00...0x9FFF, 0xA000...0xA4CF, 0xAC00...0xD7A3,

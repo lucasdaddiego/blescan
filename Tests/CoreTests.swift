@@ -403,6 +403,19 @@ let ibeaconBytes: [UInt8] =
         eq(charDisplayWidth("😀"), 2, "emoji → 2")
         eq(charDisplayWidth("🇬🇧"), 2, "flag emoji (regional indicators) → 2")
 
+        // Clusters whose *base* scalar is narrow but whose glyph is not: measuring only the
+        // first scalar reported these as 1 column while the terminal paints 2, so a name
+        // built from them overran the row budget and wrapped (frame tearing).
+        eq(charDisplayWidth("\u{2764}"), 1, "bare U+2764 (text glyph) → 1")
+        eq(charDisplayWidth("\u{2764}\u{FE0F}"), 2, "U+2764 + VS16 (emoji presentation) → 2")
+        eq(charDisplayWidth("\u{2764}\u{FE0E}"), 1, "U+2764 + VS15 (text presentation) → 1")
+        eq(charDisplayWidth("1\u{FE0F}\u{20E3}"), 2, "keycap sequence → 2")
+        eq(charDisplayWidth("1\u{20E3}"), 2, "unqualified keycap (no VS16) → 2")
+        let hearts = String(repeating: "\u{2764}\u{FE0F}", count: 13)
+        eq(displayWidth(hearts), 26, "13 emoji hearts measure 26 columns, not 13")
+        eq(truncateToWidth(hearts, 14).count, 7, "emoji name clipped to the column budget")
+        eq(displayWidth(padTo(hearts, 27)), 27, "padded emoji name fills its cell exactly")
+
         eq(displayWidth("a你"), 3, "mixed display width")
         eq(padTo("ab", 4), "ab  ", "padTo pads right")
         eq(padTo("hello", 3), "hel", "padTo truncates")
