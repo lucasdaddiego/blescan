@@ -181,7 +181,7 @@ blescan --help           # usage summary
 | Flag | Description |
 |------|-------------|
 | `--once` | Single ~6 s scan; print the device table, then exit. |
-| `--json` | Single ~6 s scan; emit a JSON array on stdout. |
+| `--json` | Single ~6 s scan; emit a JSON array on stdout (exit 3 if the adapter never powered on). |
 | `--diag` | Print adapter state, permission status and device/name counts. |
 | `--help`, `-h` | Show usage. |
 
@@ -272,7 +272,10 @@ All of this lives in the framework‑free `Core.swift`, unit‑tested at **100% 
 strongest first; keys alphabetised). Fields that aren't advertised are omitted — beacons
 add structured `iBeacon` / `eddystone` fields, `serviceData` carries the raw hex of each
 service‑data entry, `companyId` is the raw `0xXXXX`, and `rssi` is dropped when the radio
-reports it unavailable:
+reports it unavailable. If the adapter never reaches `poweredOn` (Bluetooth off, permission
+denied, no BLE support) the array is still printed, but a one‑line reason goes to stderr and
+the exit status is **3** — so a script never mistakes "the radio was off" for "nobody was
+advertising":
 
 ```jsonc
 [

@@ -323,10 +323,16 @@ func proximity(rssi: Int, calibratedRSSIAt1m ref: Int?) -> Proximity {
     guard rssi < 0, rssi > -127 else { return .unknown }   // 0 / 127 == unavailable
     if let ref = ref {
         let d = estimateDistanceMeters(rssi: rssi, calibratedRSSIAt1m: ref)
-        if d < 0 { return .unknown }
-        if d < 0.5 { return .immediate }
-        if d < 4.0 { return .near }
-        return .far
+        // A reference of 0 is an unusable calibration (an uncalibrated beacon shipping the
+        // default measured-power byte, or an Eddystone tx power of exactly 41), which is the
+        // one case estimateDistanceMeters answers with its -1 sentinel. That means "no usable
+        // reference", not "no idea how far away this is" — so fall through to the RSSI
+        // thresholds below rather than reporting worse than a device with no calibration.
+        if d >= 0 {
+            if d < 0.5 { return .immediate }
+            if d < 4.0 { return .near }
+            return .far
+        }
     }
     if rssi >= -55 { return .immediate }
     if rssi >= -75 { return .near }
@@ -351,23 +357,32 @@ enum SortKey {
 /// RSSI used for ordering: the unavailable sentinel (0 / 127) sorts to the bottom.
 private func effectiveRSSI(_ d: Device) -> Int { d.hasValidRSSI ? d.rssi : -9999 }
 
+/// The tiebreak every key ends on: stronger RSSI first, then the stable identifier. The id
+/// step is what makes the order TOTAL — without it two devices that tie on both the key and
+/// the RSSI compare `false` in both directions, so their relative order is whatever
+/// `snapshotDevices()` happened to hand `sorted()`, and the rows visibly swap places the
+/// next time the device dictionary rehashes (i.e. when an unrelated device is discovered).
+private func rssiThenID(_ a: Device, _ b: Device) -> Bool {
+    effectiveRSSI(a) != effectiveRSSI(b) ? effectiveRSSI(a) > effectiveRSSI(b) : a.id < b.id
+}
+
 /// Strict ordering of two devices for `key`'s default direction. Every key falls back to
 /// RSSI then the stable identifier so the order is total (extracted from `sortDevices` so
 /// each branch is unit-testable). Named devices sort before unnamed in name order.
 func deviceBefore(_ a: Device, _ b: Device, by key: SortKey) -> Bool {
     switch key {
     case .rssi:
-        return effectiveRSSI(a) != effectiveRSSI(b) ? effectiveRSSI(a) > effectiveRSSI(b) : a.id < b.id
+        return rssiThenID(a, b)
     case .name:
         if a.isNamed != b.isNamed { return a.isNamed }   // named first
         let an = a.displayName.lowercased(), bn = b.displayName.lowercased()
-        return an != bn ? an < bn : effectiveRSSI(a) > effectiveRSSI(b)
+        return an != bn ? an < bn : rssiThenID(a, b)
     case .vendor:
-        return a.vendor != b.vendor ? a.vendor < b.vendor : effectiveRSSI(a) > effectiveRSSI(b)
+        return a.vendor != b.vendor ? a.vendor < b.vendor : rssiThenID(a, b)
     case .type:
-        return a.typeLabel != b.typeLabel ? a.typeLabel < b.typeLabel : effectiveRSSI(a) > effectiveRSSI(b)
+        return a.typeLabel != b.typeLabel ? a.typeLabel < b.typeLabel : rssiThenID(a, b)
     case .age:
-        return a.lastSeen != b.lastSeen ? a.lastSeen > b.lastSeen : effectiveRSSI(a) > effectiveRSSI(b)
+        return a.lastSeen != b.lastSeen ? a.lastSeen > b.lastSeen : rssiThenID(a, b)
     }
 }
 
@@ -542,7 +557,8 @@ func formatAge(_ seconds: Double) -> String {
 
 /// Approximate East-Asian display width of a single Character (0/1/2 cells).
 func charDisplayWidth(_ c: Character) -> Int {
-    let v = c.unicodeScalars.first!.value
+    let first = c.unicodeScalars.first!
+    let v = first.value
     if v == 0 { return 0 }
     if (0x0300...0x036F).contains(v) || (0x200B...0x200F).contains(v) || v == 0xFEFF { return 0 }
     // Measure the whole cluster, not just its base scalar: an emoji-presentation selector
@@ -552,6 +568,14 @@ func charDisplayWidth(_ c: Character) -> Int {
     // a name built from them overran the row budget and wrapped, tearing the frame. VS15
     // (U+FE0E, text presentation) is deliberately absent: it keeps the glyph narrow.
     if c.unicodeScalars.contains(where: { $0.value == 0xFE0F || $0.value == 0x20E3 }) { return 2 }
+    // The other half of that story: emoji whose DEFAULT presentation is already emoji
+    // (✅ ❌ ⭐ ⌚ ⏰ …) carry no selector to spot them by, and they are scattered across
+    // blocks the hardcoded table below never listed — so a name of 13 ✅ measured 13 and
+    // painted 26, tearing the frame exactly like the VS16 case. Ask the Unicode data rather
+    // than trying to enumerate them: UAX #11 gives every Emoji_Presentation scalar
+    // East_Asian_Width=Wide, so this can only ever agree with a terminal — checked scalar by
+    // scalar against python-wcwidth, which it moves 86 characters towards and none away from.
+    if first.properties.isEmojiPresentation { return 2 }
     let wide: [ClosedRange<UInt32>] = [
         0x1100...0x115F, 0x2329...0x232A, 0x2E80...0x303E, 0x3041...0x33FF,
         0x3400...0x4DBF, 0x4E00...0x9FFF, 0xA000...0xA4CF, 0xAC00...0xD7A3,
@@ -609,24 +633,39 @@ func widthFittingVariant(_ variants: [String], _ n: Int) -> String {
 
 /// Replace anything that can move the cursor, recolour/clear the terminal, OR visually
 /// reorder/hide text with a visible middle-dot placeholder: C0 controls (incl. ESC, CR,
-/// LF, TAB), DEL, C1 controls, the Unicode bidi controls (embeddings/overrides/isolates +
-/// LRM/RLM/ALM), the zero-width formatters (ZWSP/ZW(N)J/BOM) and the line/paragraph
-/// separators. A hostile BLE name is arbitrary bytes, so all of these are surfaced rather
-/// than rendered. Printable text (including CJK/emoji names) passes through untouched.
+/// LF, TAB), DEL, C1 controls, the line/paragraph separators, and the WHOLE Unicode format
+/// (Cf) class — bidi controls (embeddings/overrides/isolates + LRM/RLM/ALM), the zero-width
+/// formatters (ZWSP/ZW(N)J/BOM), the word joiner and invisible operators, the deprecated
+/// format characters, SHY, and the tag block. Cf is tested by category rather than by
+/// enumerated ranges because the enumeration kept missing members (U+2060, U+206A–206F,
+/// U+00AD, U+180E, U+E0001 …) and each one that slips through is a scalar the terminal
+/// paints in ZERO columns while charDisplayWidth counts it as one — so a name padded to its
+/// cell comes up short and every column to its right is drawn shifted left. A hostile BLE
+/// name is arbitrary bytes, so all of these are surfaced rather than rendered. Printable
+/// text (including CJK/emoji names) passes through untouched.
 func sanitizeName(_ s: String) -> String {
     let placeholder: Unicode.Scalar = "\u{00B7}"   // ·
     var out = String.UnicodeScalarView()
     for scalar in s.unicodeScalars {
         let v = scalar.value
         let bad = v < 0x20 || v == 0x7F || (0x80...0x9F).contains(v)   // C0, DEL, C1
-            || v == 0x061C                          // Arabic letter mark
-            || (0x200B...0x200F).contains(v)        // ZWSP/ZWNJ/ZWJ + LRM/RLM
-            || (0x2028...0x202E).contains(v)        // line/para separators + bidi embed/override
-            || (0x2066...0x2069).contains(v)        // bidi isolates
-            || v == 0xFEFF                          // ZWNBSP / BOM
+            || scalar.properties.generalCategory == .format   // every Cf (see above)
+            || (0x2028...0x2029).contains(v)                  // line / paragraph separators
         out.append(bad ? placeholder : scalar)
     }
     return String(out)
+}
+
+// MARK: - Headless scan outcome
+
+/// Diagnostic for a headless (`--json`) scan whose adapter never reached
+/// poweredOn — nil when the scan actually ran. Bluetooth off, permission denied and "this
+/// Mac has no BLE" all end with zero devices heard, which on stdout is indistinguishable
+/// from a genuinely quiet room; `blescan --json | jq length` would read 0 and conclude
+/// "nothing nearby". The caller pairs this line (on stderr) with a non-zero exit status so
+/// a script can tell "nothing was there" from "nothing was listening".
+func headlessScanFailure(poweredOn: Bool, state: String, authorization: String) -> String? {
+    poweredOn ? nil : "blescan: no scan performed — adapter \(state), permission \(authorization)"
 }
 
 // MARK: - Bluetooth SIG assigned numbers (curated subsets)

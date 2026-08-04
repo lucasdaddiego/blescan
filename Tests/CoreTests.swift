@@ -59,6 +59,7 @@ let ibeaconBytes: [UInt8] =
         testLayout()
         testFittingVariant()
         testSanitize()
+        testHeadlessOutcome()
         testDevice()
 
         print("\(checks - failures)/\(checks) checks passed")
@@ -233,7 +234,11 @@ let ibeaconBytes: [UInt8] =
         eq(proximity(rssi: -50, calibratedRSSIAt1m: -59), .immediate, "ref → immediate")
         eq(proximity(rssi: -70, calibratedRSSIAt1m: -59), .near, "ref → near")
         eq(proximity(rssi: -95, calibratedRSSIAt1m: -59), .far, "ref → far")
-        eq(proximity(rssi: -50, calibratedRSSIAt1m: 0), .unknown, "ref 0 → unknown distance")
+        // An unusable reference (0) is "no calibration", not "no idea": the RSSI thresholds
+        // still apply, so a beacon shipping the default measured-power byte can't report
+        // worse than the same device advertising no calibration at all.
+        eq(proximity(rssi: -50, calibratedRSSIAt1m: 0), .immediate, "ref 0 → falls back to RSSI")
+        eq(proximity(rssi: -95, calibratedRSSIAt1m: 0), .far, "ref 0 → RSSI threshold, far end")
         // proximity without a reference (RSSI thresholds)
         eq(proximity(rssi: -50, calibratedRSSIAt1m: nil), .immediate, "no ref → immediate")
         eq(proximity(rssi: -70, calibratedRSSIAt1m: nil), .near, "no ref → near")
@@ -287,6 +292,20 @@ let ibeaconBytes: [UInt8] =
         ok(deviceBefore(dev(rssi: -40, svc: ["180D"]), dev(rssi: -70, svc: ["180D"]), by: .type),
            "equal type → stronger rssi")
         ok(deviceBefore(dev(rssi: -40, last: 5), dev(rssi: -70, last: 5), by: .age), "equal age → stronger rssi")
+
+        // Totality. Devices that tie on the key AND on RSSI must still compare — every
+        // branch but .rssi used to stop at the RSSI tiebreaker and report `false` in both
+        // directions, leaving their order to be whatever snapshotDevices() handed sorted().
+        // On screen the tied rows then swap places whenever the device dictionary rehashes.
+        let tied = [dev(id: "a", name: nil, rssi: -70), dev(id: "b", name: nil, rssi: -70),
+                    dev(id: "c", name: nil, rssi: -70)]
+        for key in [SortKey.name, .vendor, .type, .age] {
+            eq(order(sortDevices(tied, by: key, ascending: false)),
+               order(sortDevices(Array(tied.reversed()), by: key, ascending: false)),
+               "\(key.label): fully tied devices sort the same whatever order they arrive in")
+            ok(deviceBefore(tied[0], tied[1], by: key) != deviceBefore(tied[1], tied[0], by: key),
+               "\(key.label): fully tied devices still compare (antisymmetric, not equal)")
+        }
 
         eq(SortKey.rssi.label, "RSSI", "label rssi")
         eq(SortKey.name.label, "Name", "label name")
@@ -411,6 +430,24 @@ let ibeaconBytes: [UInt8] =
         eq(charDisplayWidth("\u{2764}\u{FE0E}"), 1, "U+2764 + VS15 (text presentation) → 1")
         eq(charDisplayWidth("1\u{FE0F}\u{20E3}"), 2, "keycap sequence → 2")
         eq(charDisplayWidth("1\u{20E3}"), 2, "unqualified keycap (no VS16) → 2")
+
+        // The other half: emoji that are already emoji-presentation by DEFAULT carry no
+        // selector, sit outside the hardcoded wide ranges, and used to measure 1 — verified
+        // against python-wcwidth, which reports 2 for every one of these.
+        eq(charDisplayWidth("\u{2705}"), 2, "U+2705 ✅ (default emoji presentation) → 2")
+        eq(charDisplayWidth("\u{274C}"), 2, "U+274C ❌ (default emoji presentation) → 2")
+        eq(charDisplayWidth("\u{2B50}"), 2, "U+2B50 ⭐ (default emoji presentation) → 2")
+        eq(charDisplayWidth("\u{231A}"), 2, "U+231A ⌚ (default emoji presentation) → 2")
+        eq(charDisplayWidth("\u{23F0}"), 2, "U+23F0 ⏰ (default emoji presentation) → 2")
+        eq(charDisplayWidth("\u{25FD}"), 2, "U+25FD ◽ (default emoji presentation) → 2")
+        eq(charDisplayWidth("\u{2757}"), 2, "U+2757 ❗ (default emoji presentation) → 2")
+        // …while the text-presentation neighbours in the same blocks stay narrow.
+        eq(charDisplayWidth("\u{2708}"), 1, "U+2708 ✈ (text presentation by default) → 1")
+        eq(charDisplayWidth("\u{2B1A}"), 1, "U+2B1A ⬚ (not emoji at all) → 1")
+        let checks = String(repeating: "\u{2705}", count: 13)
+        eq(displayWidth(checks), 26, "13 ✅ measure 26 columns, not 13")
+        eq(truncateToWidth(checks, 14).count, 7, "✅ name clipped to the column budget")
+
         let hearts = String(repeating: "\u{2764}\u{FE0F}", count: 13)
         eq(displayWidth(hearts), 26, "13 emoji hearts measure 26 columns, not 13")
         eq(truncateToWidth(hearts, 14).count, 7, "emoji name clipped to the column budget")
@@ -452,7 +489,37 @@ let ibeaconBytes: [UInt8] =
         eq(sanitizeName("evil\u{202E}txet.gpj"), "evil·txet.gpj", "RTL override neutralised")
         eq(sanitizeName("x\u{2066}y"), "x·y", "bidi isolate neutralised")
         eq(sanitizeName("x\u{FEFF}y"), "x·y", "BOM neutralised")
+        // The rest of the Cf class — each of these renders in ZERO columns, so one slipping
+        // through makes the row measure wider than it paints and shears every column to its
+        // right leftwards. (The enumerated ranges this replaced missed all five.)
+        eq(sanitizeName("x\u{2060}y"), "x·y", "word joiner neutralised")
+        eq(sanitizeName("x\u{206A}y"), "x·y", "deprecated format char neutralised")
+        eq(sanitizeName("x\u{00AD}y"), "x·y", "soft hyphen neutralised")
+        eq(sanitizeName("x\u{180E}y"), "x·y", "Mongolian vowel separator neutralised")
+        eq(sanitizeName("x\u{E0001}y"), "x·y", "tag character neutralised")
+        // The row-level consequence: 20 word joiners used to fill the Name cell with 20
+        // invisible columns, so padTo added no padding at all and the whole row slid left.
+        let joiners = "X" + String(repeating: "\u{2060}", count: 20)
+        eq(sanitizeName(joiners), "X" + String(repeating: "·", count: 20),
+           "hostile zero-width run is surfaced, so it measures what it paints")
+        eq(padTo(sanitizeName(joiners), 14), "X" + String(repeating: "·", count: 13),
+           "…and is clipped to the Name cell instead of filling it invisibly")
         eq(displayWidth(sanitizeName("a\u{1B}\u{7F}b")), 4, "sanitised name keeps width")
+    }
+
+    // MARK: Headless (--json) scan outcome
+
+    static func testHeadlessOutcome() {
+        ok(headlessScanFailure(poweredOn: true, state: "poweredOn", authorization: "authorized") == nil,
+           "a scan that actually ran reports no failure")
+        // Without this, --json prints "[]" and exits 0 whether the room was quiet or the
+        // radio was never on, so `blescan --json | jq length` reads 0 for both.
+        eq(headlessScanFailure(poweredOn: false, state: "poweredOff", authorization: "authorized"),
+           "blescan: no scan performed — adapter poweredOff, permission authorized",
+           "adapter never powered on → a reason for stderr")
+        eq(headlessScanFailure(poweredOn: false, state: "unauthorized", authorization: "denied"),
+           "blescan: no scan performed — adapter unauthorized, permission denied",
+           "permission denial is named in the reason")
     }
 
     // MARK: Device computed properties
@@ -466,6 +533,16 @@ let ibeaconBytes: [UInt8] =
         eq(beacon.typeLabel, "iBeacon", "device type label")
         eq(beacon.calibratedRSSIAt1m, -59, "calibrated ref from iBeacon measured power")
         eq(beacon.proximityBucket, .near, "iBeacon proximity from ref")
+
+        // An iBeacon advertising the uncalibrated default measured-power byte (0x00) has a
+        // reference the ranging curve can't use — it must fall back to the RSSI thresholds
+        // like any uncalibrated advert, not report "—" while the same device with no
+        // manufacturer data at all reports "immediate".
+        let uncalibrated: [UInt8] =
+            [0x4C, 0x00, 0x02, 0x15] + Array(repeating: 0x01, count: 16) + [0x00, 0x2A, 0x00, 0x07, 0x00]
+        eq(dev(rssi: -50, mfg: uncalibrated).calibratedRSSIAt1m, 0, "uncalibrated iBeacon ref is 0")
+        eq(dev(rssi: -50, mfg: uncalibrated).proximityBucket, .immediate,
+           "uncalibrated iBeacon buckets by RSSI, like a device with no calibration")
 
         // Eddystone-URL device: 1 m ref derived from 0 m tx power (− 41).
         let urlSvc = ServiceDatum(uuid: "FEAA", bytes: [0x10, 0xEC, 0x02, 0x67])

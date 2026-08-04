@@ -529,6 +529,13 @@ final class App {
 private var savedTermios = termios()
 private var rawActive: sig_atomic_t = 0
 
+// The leave sequence, plus the same bytes in a plain C buffer: mouse reporting off · show
+// cursor · leave the alt screen · restore the window title. prepareSignalSafeLeave() fills
+// the buffer so the signal handler never has to build it (see leaveRawFromSignal).
+private let leaveSequence = "\u{1B}[?1006l\u{1B}[?1000l\u{1B}[?25h\u{1B}[?1049l\u{1B}[23;2t"
+private var leaveBytes: UnsafeMutablePointer<UInt8>?
+private var leaveByteCount = 0
+
 /// Write a string straight to the fd, looping over partial writes and retrying on EINTR.
 /// Used for every byte we emit in raw mode (enter/leave sequences AND each frame), so the
 /// TUI never mixes buffered stdio with raw writes — a full frame can be several KB and a
@@ -542,6 +549,18 @@ private func writeRaw(_ s: String) {
         if n == 0 { break }
         off += n
     }
+}
+
+/// Snapshot the leave sequence into a plain C buffer. MUST run before the signal handlers
+/// are installed — building it inside a handler is the very thing leaveRawFromSignal exists
+/// to avoid. Allocated once and owned for the life of the process.
+private func prepareSignalSafeLeave() {
+    guard leaveBytes == nil else { return }
+    let bytes = Array(leaveSequence.utf8)
+    let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: bytes.count)
+    buf.update(from: bytes, count: bytes.count)
+    leaveBytes = buf
+    leaveByteCount = bytes.count
 }
 
 private func enterRaw() {
@@ -565,7 +584,30 @@ private func enterRaw() {
 private func leaveRaw() {
     guard rawActive != 0 else { return }
     rawActive = 0
-    writeRaw("\u{1B}[?1006l\u{1B}[?1000l\u{1B}[?25h\u{1B}[?1049l\u{1B}[23;2t")
+    writeRaw(leaveSequence)
+    tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
+}
+
+/// leaveRaw for a SIGNAL HANDLER: the same restore, but async-signal-safe. It touches only
+/// write(2) and tcsetattr(2) over the buffer prepareSignalSafeLeave() built up front — never
+/// the String path, because writeRaw's `Array(s.utf8)` mallocs and draw() keeps the
+/// interrupted thread inside malloc thousands of times a second. A handler that re-enters
+/// libmalloc's lock never returns, `_exit(0)` is never reached, and the user is left with a
+/// wedged terminal (alt screen up, ECHO/ICANON/ISIG off, mouse reporting on) that needs a
+/// `kill -9` from another window and a `reset`. Ctrl-C does NOT arrive here (ISIG is cleared,
+/// so 0x03 comes through as a byte) — `kill`, a teardown script or a logout does.
+private func leaveRawFromSignal() {
+    guard rawActive != 0 else { return }
+    rawActive = 0
+    if let p = leaveBytes {
+        var off = 0
+        while off < leaveByteCount {
+            let n = write(STDOUT_FILENO, p + off, leaveByteCount - off)
+            if n < 0 { if errno == EINTR { continue }; break }
+            if n == 0 { break }
+            off += n
+        }
+    }
     tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
 }
 
@@ -614,8 +656,9 @@ private func readInput() -> Input {
 // MARK: - Interactive loop
 
 func runInteractive(app: App) {
+    prepareSignalSafeLeave()   // before the handlers: they must never build it themselves
     for sig in [SIGINT, SIGTERM] {
-        signal(sig) { _ in leaveRaw(); _exit(0) }
+        signal(sig) { _ in leaveRawFromSignal(); _exit(0) }
     }
     atexit { leaveRaw() }
     enterRaw()
@@ -895,6 +938,16 @@ func runOnce(app: App, window: TimeInterval, json: Bool) {
         }
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? enc.encode(arr), let s = String(data: data, encoding: .utf8) { print(s) } else { print("[]") }
+        // The array is on stdout either way; if the radio never came up, say so on stderr
+        // and exit 3 so a caller can tell an empty room from a scan that never happened.
+        // (--once prints its own hint line and --diag reports the state, so JSON was the
+        // only mode with no signal at all.)
+        if let problem = headlessScanFailure(poweredOn: app.snapshotState() == .poweredOn,
+                                             state: stateLabel(app.snapshotState()),
+                                             authorization: authLabel(app.radio.authorization)) {
+            FileHandle.standardError.write(Data((problem + "\n").utf8))
+            exit(3)
+        }
         return
     }
     print(Ansi.bold("blescan — \(devices.count) BLE devices  (adapter \(stateLabel(app.snapshotState())), permission \(authLabel(app.radio.authorization)))"))
@@ -939,6 +992,9 @@ func printHelp() {
       blescan --json     scan ~6s, emit the devices as JSON on stdout
       blescan --diag     print adapter / permission diagnostics
       blescan --help     show this help  (also -h)
+
+    --json exits 3 (with a line on stderr) when the adapter never powered on, so an
+    empty array from a quiet room is distinguishable from a scan that never happened.
 
     Colour is automatic: on in a terminal, off when piped/redirected (or set NO_COLOR).
 
