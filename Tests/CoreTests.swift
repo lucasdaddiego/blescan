@@ -11,7 +11,7 @@
 
 import Foundation
 
-var checks = 0, failures = 0
+nonisolated(unsafe) var checks = 0, failures = 0   // single-threaded test runner
 func ok(_ cond: Bool, _ msg: String) {
     checks += 1
     if !cond { failures += 1; print("FAIL: \(msg)") }
@@ -65,6 +65,10 @@ let ibeaconBytes: [UInt8] =
         testAbsorb()
         testAdvertRate()
         testArguments()
+        testContinuityUnion()
+        testNameHints()
+        testIdentity()
+        testView()
 
         print("\(checks - failures)/\(checks) checks passed")
         exit(failures == 0 ? 0 : 1)
@@ -89,7 +93,9 @@ let ibeaconBytes: [UInt8] =
         eq(companyName(0x067C), "Tile", "Tile company name")
         ok(companyName(0xFFFE) == nil, "unknown company id → nil")
         eq(vendorLabel(0x004C), "Apple", "vendorLabel known → name")
-        eq(vendorLabel(0xABCD), "0xABCD", "vendorLabel unknown → hex")
+        eq(vendorLabel(0x0310), "0x0310", "vendorLabel assigned but not curated → bare hex")
+        eq(vendorLabel(sigMaxAssignedCompanyId), "0x110D", "vendorLabel at the top of the assigned range → bare hex")
+        eq(vendorLabel(0x57F7), "0x57F7 unassigned", "vendorLabel beyond the SIG range → marked unassigned")
         eq(vendorLabel(nil), "—", "vendorLabel nil → dash")
     }
 
@@ -200,6 +206,10 @@ let ibeaconBytes: [UInt8] =
         eq(t(["FD6F"]), "Exposure Notification", "Exposure Notification")
         eq(t(["FE2C"]), "Google Fast Pair", "Fast Pair")
         eq(t(cont: [0x12]), "Find My / AirTag", "Find My via continuity")
+        eq(t(company: 0x004C, cont: [0x12, 0x10]), "Apple device", "Find My + Nearby Info = a phone, not a tag")
+        eq(t(company: 0x004C, cont: [0x12, 0x0C]), "Apple device", "Find My + Handoff = a phone, not a tag")
+        eq(t(["1812"], company: 0x004C, cont: [0x10]), "Keyboard / mouse (HID)", "GATT signature beats the Apple fallback")
+        eq(t(company: 0x004C, cont: [0x10], name: "Lucas iPad"), "iPad", "name hint beats the Apple fallback")
         eq(t(["FD44"]), "Find My / AirTag", "Find My via FD44")
         eq(t(["FD43"]), "Find My / AirTag", "Find My via FD43")
         eq(t(cont: [0x07]), "AirPods / Apple audio", "AirPods")
@@ -581,10 +591,14 @@ let ibeaconBytes: [UInt8] =
         eq(twice.advertisedServices, ["FEAA", "180F", "0000180A-0000-1000-8000-00805F9B34FB"],
            "advertisedServices dedupes across service list + service data, order kept")
         eq(plain.continuityTypes, [], "non-Apple device has no continuity segments")
+        eq(dev(mfg: [0x4C, 0x00, 0x10, 0x02, 0xAA, 0xBB, 0x0C, 0x01, 0x00]).continuityTypes, [0x0C, 0x10],
+           "device continuity types are the sorted union")
 
         // Names + validity flags.
         eq(dev(name: "Buds").displayName, "Buds", "named displayName")
         eq(dev(name: nil).displayName, "(unnamed)", "unnamed placeholder")
+        ok(dev(mfg: ibeaconBytes).beaconKey == "ibeacon:01010101-0101-0101-0101-010101010101/42/7", "iBeacon key")
+        ok(dev().beaconKey == nil, "plain device has no beacon key")
         eq(dev(name: "").displayName, "(unnamed)", "empty name placeholder")
         ok(dev(name: "x").isNamed, "isNamed true when named")
         ok(!dev(name: nil).isNamed, "isNamed false when unnamed")
@@ -645,6 +659,119 @@ let ibeaconBytes: [UInt8] =
         eq(d.calibratedRSSIAt1m, -59, "iBeacon reference wins over the Eddystone one")
     }
 
+    // MARK: Continuity union across packets
+
+    static func testContinuityUnion() {
+        // Packet 1: Nearby Info (0x10). Packet 2: Find My (0x12). Packet 3: Handoff (0x0C).
+        // Fingerprinting only the latest payload flipped Type between "Apple device" and
+        // "Find My / AirTag" on every other frame; the union settles on the phone.
+        var d = dev(mfg: [0x4C, 0x00, 0x10, 0x01, 0x00])
+        eq(d.typeLabel, "Apple device", "first packet: Nearby Info → Apple device")
+        d.absorb(dev(mfg: [0x4C, 0x00, 0x12, 0x01, 0x00]), at: 1)
+        eq(d.continuityTypes, [0x10, 0x12], "union keeps the earlier segment type")
+        eq(d.typeLabel, "Apple device", "Find My frame from a Nearby-Info sender stays a phone")
+        d.absorb(dev(mfg: [0x4C, 0x00, 0x0C, 0x01, 0x00]), at: 2)
+        eq(d.continuityTypes, [0x0C, 0x10, 0x12], "three packets, three types, sorted")
+        // A genuine tag only ever sends Find My frames.
+        var tag = dev(mfg: [0x4C, 0x00, 0x12, 0x01, 0x00])
+        tag.absorb(dev(mfg: [0x4C, 0x00, 0x12, 0x01, 0x00]), at: 1)
+        eq(tag.typeLabel, "Find My / AirTag", "Find My alone stays a tag")
+        // Re-absorbing already-known types is not a fingerprint change.
+        let fp = tag.fingerprint.typeLabel
+        tag.absorb(dev(mfg: [0x4C, 0x00, 0x12, 0x01, 0x00]), at: 2)
+        eq(tag.fingerprint.typeLabel, fp, "known segment types leave the fingerprint untouched")
+    }
+
+    // MARK: Name hints
+
+    static func testNameHints() {
+        ok(nameTypeHint(nil) == nil, "no name → no hint")
+        ok(nameTypeHint("") == nil, "empty name → no hint")
+        ok(nameTypeHint("Widget") == nil, "unrecognised name → no hint")
+        eq(nameTypeHint("Lucas’ AirPods Pro"), "AirPods / Apple audio", "substring key, any case")
+        eq(nameTypeHint("[TV] UN55J5500"), "TV", "whole-word key matches a bracketed token")
+        ok(nameTypeHint("Activity Tracker") == nil, "whole-word key does not fire inside a word (tv in activity)")
+        eq(nameTypeHint("Galaxy Watch6"), "Watch", "galaxy watch before galaxy")
+        eq(nameTypeHint("Forerunner 255"), "Watch", "Garmin model names")
+        eq(nameTypeHint("WH-1000XM5"), "Headphones / speaker", "Sony prefix")
+        eq(nameTypeHint("Magic Mouse"), "Keyboard / mouse (HID)", "mouse as a word")
+        eq(nameTypeHint("Pixel 8"), "Phone / tablet", "pixel as a word")
+        eq(nameTypeHint("tile"), "Tile tracker", "tile as a word")
+        ok(nameTypeHint("Textile Sensor") == nil, "tile inside textile does not fire")
+        eq(nameTypeHint("Tesla Model 3"), "Vehicle", "vehicle")
+        eq(dev(name: "Flic", mfg: [0x30, 0x0F]).typeLabel, "Flic button", "hint reaches the device type")
+    }
+
+    // MARK: Identity across address rotation
+
+    static func testIdentity() {
+        var linker = IdentityLinker()
+        var plain = dev(id: "p")
+        linker.link(&plain)
+        ok(plain.previousID == nil, "no beacon key → nothing to link")
+
+        var a = dev(id: "A", mfg: ibeaconBytes, first: 10, last: 10)
+        linker.link(&a)
+        ok(a.previousID == nil, "first sighting of a key has no predecessor")
+        linker.link(&a)
+        ok(a.previousID == nil && a.firstSeen == 10, "re-linking the same id is a no-op")
+
+        // The address rotates: same iBeacon payload, new peripheral id, later firstSeen.
+        var b = dev(id: "B", mfg: ibeaconBytes, first: 900, last: 900)
+        linker.link(&b)
+        eq(b.previousID, "A", "rotated beacon points at its previous id")
+        eq(b.firstSeen, 10, "…and inherits the original firstSeen, so 'first heard' survives the rotation")
+
+        // A third rotation chains from B, and keeps the ORIGINAL firstSeen through B.
+        var c = dev(id: "C", mfg: ibeaconBytes, first: 1800, last: 1800)
+        linker.link(&c)
+        eq(c.previousID, "B", "chains from the latest id")
+        eq(c.firstSeen, 10, "original firstSeen carried through the chain")
+
+        // Once the ids it remembers are pruned, the key is forgotten.
+        linker.forget(ids: ["C"])
+        var d = dev(id: "D", mfg: ibeaconBytes, first: 5000, last: 5000)
+        linker.link(&d)
+        ok(d.previousID == nil, "forgotten key → fresh identity")
+        linker.forget(ids: ["zzz"])
+        var e = dev(id: "E", mfg: ibeaconBytes, first: 5001, last: 5001)
+        linker.link(&e)
+        eq(e.previousID, "D", "forgetting unrelated ids keeps the key")
+
+        eq(beaconIdentity(iBeacon: nil, eddystone: .uid(txPower: 0, namespace: "ns", instance: "i")), "eddystone-uid:ns/i", "UID key")
+        eq(beaconIdentity(iBeacon: nil, eddystone: .url(txPower: 0, url: "https://x")), "eddystone-url:https://x", "URL key")
+        ok(beaconIdentity(iBeacon: nil, eddystone: .eid(txPower: 0, eid: "e")) == nil, "EID rotates by design → no key")
+        ok(beaconIdentity(iBeacon: nil, eddystone: nil) == nil, "no beacon → no key")
+    }
+
+    // MARK: Shared view (filter / toggles / sort)
+
+    static func testView() {
+        let ds = [dev(id: "a", name: "Bose QC", rssi: -50, conn: true, mfg: [0x9E, 0x00]),
+                  dev(id: "b", name: nil, rssi: -40, conn: false),
+                  dev(id: "c", name: "Tile", rssi: -60, conn: true)]
+        func view(filter: String = "", conn: Bool = false, named: Bool = false,
+                  sort: SortKey = .rssi, asc: Bool = false) -> String {
+            order(applyView(ds, filter: filter, connectableOnly: conn, namedOnly: named, sort: sort, ascending: asc))
+        }
+        eq(view(), "bac", "no filter: rssi order")
+        eq(view(conn: true), "ac", "connectable-only")
+        eq(view(named: true), "ac", "named-only")
+        eq(view(filter: "bose"), "a", "filter matches the name, case-insensitive")
+        eq(view(filter: "headphones"), "a", "filter matches the type label")
+        eq(view(filter: "0x"), "", "filter matches vendor text — none here start with 0x")
+        eq(view(sort: .name), "acb", "sort by name (named first)")
+        eq(view(sort: .name, asc: true), "bca", "reverse")
+
+        ok(SortKey(argument: "rssi") == .rssi && SortKey(argument: "power") == .rssi && SortKey(argument: "P") == .rssi, "--sort rssi / power / p")
+        ok(SortKey(argument: "name") == .name && SortKey(argument: "n") == .name, "--sort name / n")
+        ok(SortKey(argument: "vendor") == .vendor && SortKey(argument: "v") == .vendor, "--sort vendor / v")
+        ok(SortKey(argument: "type") == .type && SortKey(argument: "t") == .type, "--sort type / t")
+        ok(SortKey(argument: "age") == .age && SortKey(argument: "g") == .age, "--sort age / g")
+        ok(SortKey(argument: "rate") == .rate && SortKey(argument: "r") == .rate, "--sort rate / r")
+        ok(SortKey(argument: "colour") == nil, "--sort unknown → nil")
+    }
+
     // MARK: Advertisement rate
 
     static func testAdvertRate() {
@@ -695,5 +822,19 @@ let ibeaconBytes: [UInt8] =
            .failure(UsageError(message: "error: --window must be a positive number of seconds, got 'inf'")), "--window infinite")
         eq(parseArguments(["--bogus"]),
            .failure(UsageError(message: "error: unknown option '--bogus' (see --help)")), "unknown flag")
+
+        var want = Options(mode: .json, sort: .name, reverse: true, filter: "bose", connectableOnly: true, namedOnly: true)
+        eq(parseArguments(["--json", "--sort", "name", "--reverse", "--filter", "bose", "--connectable", "--named"]),
+           .success(want), "view flags, space form")
+        want.mode = .tui
+        eq(parseArguments(["--sort=name", "--reverse", "--filter=bose", "--connectable", "--named"]),
+           .success(want), "view flags, = form, seed the TUI")
+        eq(parseArguments(["--sort"]),
+           .failure(UsageError(message: "error: --sort needs a key: rssi, name, vendor, type, age or rate (see --help)")), "--sort bare")
+        eq(parseArguments(["--sort", "colour"]),
+           .failure(UsageError(message: "error: --sort must be one of rssi, name, vendor, type, age, rate — got 'colour'")), "--sort unknown key")
+        eq(parseArguments(["--filter"]),
+           .failure(UsageError(message: "error: --filter needs a substring to match (see --help)")), "--filter bare")
+        eq(parseArguments(["--filter="]), .success(Options(mode: .tui, filter: "")), "--filter= is an empty filter")
     }
 }

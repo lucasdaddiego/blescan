@@ -142,7 +142,9 @@ enum Term {
 // MARK: - ANSI
 
 enum Ansi {
-    static var enabled = true
+    /// Set once in main() before anything renders, read everywhere after — hence the
+    /// `nonisolated(unsafe)`: there is no concurrent writer to guard against.
+    nonisolated(unsafe) static var enabled = true
     static func wrap(_ s: String, _ code: String) -> String {
         enabled ? "\u{1B}[\(code)m\(s)\u{1B}[0m" : s
     }
@@ -260,7 +262,7 @@ private func tableColWidths(_ cols: Int) -> (name: Int, vendor: Int, type: Int, 
                                              prox: Int, conn: Int, age: Int, rate: Int, trend: Int) {
     // Type is sized to the longest label ("Keyboard / mouse (HID)", 22) so no category is
     // ever cut mid-word; Vendor is not — company names run long and Name needs the room.
-    let vendor = 16, type = 22, dbm = 5, bar = 10, prox = 9, conn = 4, age = 4, rate = 5
+    let vendor = 18, type = 22, dbm = 5, bar = 10, prox = 9, conn = 4, age = 4, rate = 5
     let fixed = vendor + type + dbm + bar + prox + conn + age + rate
     let minName = 14
     // Trend (historyLen wide) appears only once it fits alongside a minimum-width Name and
@@ -274,7 +276,7 @@ private func tableColWidths(_ cols: Int) -> (name: Int, vendor: Int, type: Int, 
 
 /// Narrowest row the table can draw without clipping: a minimum-width Name plus the fixed
 /// columns and separators. Below this the row is clipped to the terminal, never wrapped.
-let tableMinCols = 14 + 75 + 8
+let tableMinCols = 14 + 77 + 8
 
 /// x-ranges (1-based screen columns) of each header cell paired with the sort key a
 /// click selects. Order mirrors renderTable's columns.
@@ -378,6 +380,10 @@ private func renderDetail(_ d: Device, cols: Int, now t: Double) -> [String] {
     out.append(head("▎ \(sanitizeName(d.displayName))"))
 
     out.append(field("identifier", Ansi.fg256(d.id, Pal.value) + Ansi.dim("  (host-stable UUID, not a MAC)")))
+    if let prev = d.previousID {
+        out.append(field("previously", Ansi.fg256(prev, Pal.value)
+            + Ansi.dim("  (same beacon payload; its random address rotated — first-heard age carries over)")))
+    }
 
     var sig = d.hasValidRSSI ? Ansi.signalColored("\(d.rssi) dBm", d.rssi) : Ansi.dim("— dBm")
     sig += "  " + proximityColored(d.proximityBucket)
@@ -407,6 +413,7 @@ private func renderDetail(_ d: Device, cols: Int, now t: Double) -> [String] {
         out.append(field("iBeacon", "UUID \(b.uuid)  major \(b.major)  minor \(b.minor)  power \(b.measuredPower) dBm"))
     }
     if let e = d.eddystone { out.append(field("eddystone", e.summary)) }
+    if let key = d.beaconKey { out.append(field("beacon key", Ansi.dim(key))) }
     let cont = d.continuityTypes.compactMap(continuityName)
     if !cont.isEmpty { out.append(field("continuity", cont.joined(separator: ", "))) }
 
@@ -432,6 +439,7 @@ final class App {
     private var history: [String: [Int]] = [:]
     private var lastHist: [String: Double] = [:]
     private var rates: [String: AdvertRate] = [:]
+    private var linker = IdentityLinker()
     var generation = 0
     var radioState: CBManagerState = .unknown
 
@@ -449,6 +457,8 @@ final class App {
     var quit = false
     var helpShown = false
     var spinnerTick = 0
+    var detailScroll = 0          // first detail-pane line shown (J/K, wheel over the pane)
+    var detailForID: String?      // which device detailScroll belongs to; resets on change
 
     // --- render cache (main-thread-confined): the last painted frame, one entry per screen
     // row, so draw() can rewrite only the rows that changed ---
@@ -462,6 +472,7 @@ final class App {
     var sortRegions: [(range: ClosedRange<Int>, key: SortKey)] = []
     var rowScreenStart = -1       // 1-based screen row of the first data row
     var rowIDs: [String] = []     // device id per rendered data row
+    var detailScreenStart = -1    // 1-based screen row of the detail pane's rule, -1 if hidden
     func sortColumnAt(_ col: Int) -> SortKey? { sortRegions.first { $0.range.contains(col) }?.key }
 
     /// Merge one discovery into the live table (called on the BLE queue).
@@ -473,6 +484,7 @@ final class App {
             var nd = d; nd.firstSeen = t; nd.lastSeen = t
             devices[d.id] = nd
         }
+        linker.link(&devices[d.id]!)          // a dictionary lookup unless the address just rotated
         rates[d.id, default: AdvertRate()].record(at: t)
         // Throttle the sparkline history to ~1 Hz per device so the trace spans seconds,
         // not the sub-second burst rate allow-duplicates delivers. Skip the 127 "RSSI
@@ -494,6 +506,7 @@ final class App {
         let dead = devices.filter { t - $0.value.lastSeen > drop }.map { $0.key }
         guard !dead.isEmpty else { return false }
         for id in dead { devices[id] = nil; history[id] = nil; lastHist[id] = nil; rates[id] = nil }
+        linker.forget(ids: Set(dead))
         generation += 1
         return true
     }
@@ -517,19 +530,16 @@ final class App {
         return out
     }
 
-    /// Filtered + sorted devices for display.
+    /// Filtered + sorted devices for display (the same rules the headless flags use).
     func visible(_ all: [Device]) -> [Device] {
-        var f = all
-        if connectableOnly { f = f.filter { $0.connectable == true } }
-        if namedOnly { f = f.filter { $0.isNamed } }
-        if !filter.isEmpty {
-            let q = filter.lowercased()
-            f = f.filter {
-                $0.displayName.lowercased().contains(q) || $0.vendor.lowercased().contains(q)
-                    || $0.typeLabel.lowercased().contains(q)
-            }
-        }
-        return sortDevices(f, by: sortKey, ascending: ascending)
+        applyView(all, filter: filter, connectableOnly: connectableOnly, namedOnly: namedOnly,
+                  sort: sortKey, ascending: ascending)
+    }
+
+    /// Seed the view state from the command line (`--sort`, `--reverse`, `--filter`, …).
+    func apply(_ o: Options) {
+        sortKey = o.sort; ascending = o.reverse; filter = o.filter
+        connectableOnly = o.connectableOnly; namedOnly = o.namedOnly
     }
 
     func wireRadio() {
@@ -540,15 +550,18 @@ final class App {
 
 // MARK: - Terminal raw mode
 
-private var savedTermios = termios()
-private var rawActive: sig_atomic_t = 0
+// Plain C-style globals on purpose: the signal handler below reads them, and a handler
+// can't hop to an actor. `nonisolated(unsafe)` states the contract — main thread writes
+// them during enter/leave, the handler only reads, and `rawActive` is a sig_atomic_t.
+nonisolated(unsafe) private var savedTermios = termios()
+nonisolated(unsafe) private var rawActive: sig_atomic_t = 0
 
 // The leave sequence, plus the same bytes in a plain C buffer: mouse reporting off · show
 // cursor · leave the alt screen · restore the window title. prepareSignalSafeLeave() fills
 // the buffer so the signal handler never has to build it (see leaveRawFromSignal).
 private let leaveSequence = "\u{1B}[?1006l\u{1B}[?1000l\u{1B}[?25h\u{1B}[?1049l\u{1B}[23;2t"
-private var leaveBytes: UnsafeMutablePointer<UInt8>?
-private var leaveByteCount = 0
+nonisolated(unsafe) private var leaveBytes: UnsafeMutablePointer<UInt8>?
+nonisolated(unsafe) private var leaveByteCount = 0
 
 /// Write a string straight to the fd, looping over partial writes and retrying on EINTR.
 /// Used for every byte we emit in raw mode (enter/leave sequences AND each frame), so the
@@ -631,7 +644,7 @@ enum Input { case key(Character), mouse(MouseEvent), up, down, none }
 /// One byte of lookahead: readInput peeks past an ESC to tell a lone Escape from a CSI/SS3
 /// sequence, and when the next byte turns out to be an ordinary key (Esc then `q`, typed
 /// fast) it goes here so the key is delivered on the next read instead of being swallowed.
-private var pushedBack: UInt8?
+nonisolated(unsafe) private var pushedBack: UInt8?   // main thread only (the input loop)
 
 private func readByte() -> UInt8? {
     if let b = pushedBack { pushedBack = nil; return b }
@@ -748,6 +761,8 @@ func handleKey(_ k: Character, app: App) {
     case "q": app.quit = true
     case "j": moveSelection(app, 1)
     case "k": moveSelection(app, -1)
+    case "J": app.detailScroll += 1      // clamped at draw time
+    case "K": app.detailScroll = max(0, app.detailScroll - 1)
     case "p": setSort(app, .rssi)
     case "n": setSort(app, .name)
     case "v": setSort(app, .vendor)
@@ -770,7 +785,12 @@ func handleMouse(_ m: MouseEvent, app: App) {
         return
     }
     if m.button & 64 != 0 {                                 // wheel
-        moveSelection(app, m.button & 1 == 0 ? -1 : 1)
+        let down = m.button & 1 != 0
+        if app.detailScreenStart > 0 && m.row >= app.detailScreenStart {
+            app.detailScroll = max(0, app.detailScroll + (down ? 1 : -1))   // over the pane: scroll it
+        } else {
+            moveSelection(app, down ? 1 : -1)
+        }
         app.markDirty()
         return
     }
@@ -862,6 +882,7 @@ func draw(_ app: App) {
     if app.helpShown {
         // The overlay replaces the table AND the detail pane; nothing is clickable.
         app.headerScreenRow = -1; app.rowScreenStart = -1; app.rowIDs = []; app.sortRegions = []
+        app.detailScreenStart = -1
         let body = helpLines().map { clipAnsi($0, layout.cols) }
         let budget = max(1, layout.rows - lines.count - footer.count - 1)
         lines.append(contentsOf: body.prefix(budget))
@@ -874,9 +895,17 @@ func draw(_ app: App) {
     }
 
     // Body layout: detail pane takes a bounded share of the screen, table gets the rest.
+    // A pane taller than its share scrolls (J/K, or the wheel over it) rather than being
+    // cut: a beacon with several service-data entries hex-dumps past a third of the screen.
     let detail = app.selectedID.flatMap { id in visible.first { $0.id == id } }
         .map { renderDetail($0, cols: layout.cols, now: t) } ?? []
-    let detailShown = Array(detail.prefix(min(detail.count, max(6, layout.rows / 3))))
+    if app.detailForID != app.selectedID { app.detailForID = app.selectedID; app.detailScroll = 0 }
+    let paneBudget = max(6, layout.rows / 3)
+    app.detailScroll = min(app.detailScroll, max(0, detail.count - paneBudget))
+    let detailShown = Array(detail.dropFirst(app.detailScroll).prefix(paneBudget))
+    let detailRule: String = detail.count > detailShown.count
+        ? ruleWithLabel("detail \(app.detailScroll + 1)–\(app.detailScroll + detailShown.count) of \(detail.count) · J/K or wheel to scroll", cols: layout.cols)
+        : rule
     let chrome = lines.count + footer.count + (detailShown.isEmpty ? 0 : detailShown.count + 1) + 1
     let tableBudget = max(3, layout.rows - chrome)
     let viewport = max(1, tableBudget - 1)   // minus the header row
@@ -904,12 +933,21 @@ func draw(_ app: App) {
     let used = lines.count + (detailShown.isEmpty ? 0 : detailShown.count + 1) + 1 + footer.count
     if used < layout.rows { lines.append(contentsOf: Array(repeating: "", count: layout.rows - used)) }
     if !detailShown.isEmpty {
-        lines.append(rule)
+        app.detailScreenStart = lines.count + 1
+        lines.append(detailRule)
         lines.append(contentsOf: detailShown)
+    } else {
+        app.detailScreenStart = -1
     }
     lines.append(rule)
     lines.append(contentsOf: footer.map { clipAnsi($0, layout.cols) })
     paint(app, lines, layout)
+}
+
+/// A dim horizontal rule with a label set into it: `── label ────…`, clipped to `cols`.
+private func ruleWithLabel(_ label: String, cols: Int) -> String {
+    let lead = "── " + label + " "
+    return clipAnsi(Ansi.dim(lead + String(repeating: "─", count: max(0, cols - displayWidth(lead)))), cols)
 }
 
 /// Put a frame on screen, rewriting only the rows that differ from the last frame. A full
@@ -943,6 +981,7 @@ func helpLines() -> [String] {
         Ansi.bold(Ansi.fg256("▎ keys", Pal.beacon)),
         k("q · Ctrl-C · Ctrl-D", "quit"),
         k("j / k · ↑ / ↓ · wheel", "move the selection (the detail pane follows it)"),
+        k("J / K · wheel over pane", "scroll the detail pane when it overflows"),
         k("p n v t g r", "sort by power (RSSI) · name · vendor · type · age · advert rate — press again to reverse"),
         k("c", "connectable-only toggle"),
         k("u", "named-only toggle"),
@@ -951,7 +990,8 @@ func helpLines() -> [String] {
         k("mouse", "click a column header to sort · click a row to select it"),
         "",
         Ansi.bold(Ansi.fg256("▎ columns", Pal.beacon)),
-        c("Vendor", "from the SIG company id in manufacturer data; 0xXXXX = id not in the curated table; — = no manufacturer data"),
+        c("Vendor", "from the SIG company id in manufacturer data; 0xXXXX = assigned but not in the curated table;"),
+        c("", "0xXXXX unassigned = no such SIG registration at all; — = no manufacturer data"),
         c("Type", "best guess from beacon / Continuity / service signatures"),
         c("dBm", "last RSSI; — when the radio reports it unavailable"),
         c("Signal", "the same value as a bar over the −100…−40 dBm window"),
@@ -1014,6 +1054,8 @@ struct DeviceJSON: Encodable {
     let advertsPerSecond: Double
     let firstSeenSecondsAgo: Int
     let lastSeenSecondsAgo: Int
+    let beaconKey: String?           // stable across random-address rotation (iBeacon / Eddystone UID+URL)
+    let previousId: String?          // the id this beacon was heard under before its address rotated
     let services: [String]
     let serviceNames: [String]
     let solicitedServices: [String]?
@@ -1039,6 +1081,8 @@ struct DeviceJSON: Encodable {
         advertsPerSecond = (d.advertsPerSecond * 10).rounded() / 10
         firstSeenSecondsAgo = Int(d.seenFor(now: t).rounded())
         lastSeenSecondsAgo = Int(d.age(now: t).rounded())
+        beaconKey = d.beaconKey
+        previousId = d.previousID
         services = d.advertisedServices
         serviceNames = d.advertisedServices.map(friendlyService)
         solicitedServices = nilIfEmpty(d.solicitedUUIDs)
@@ -1067,7 +1111,7 @@ private func failIfNeverScanned(_ app: App) {
 }
 
 func runOnce(app: App, window: TimeInterval, json: Bool) {
-    let devices = sortDevices(collect(app: app, window: window), by: app.sortKey, ascending: app.ascending)
+    let devices = app.visible(collect(app: app, window: window))   // --filter / --sort / toggles
     let t = now()   // after the scan, so the ages are measured from the moment of output
     if json {
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -1076,7 +1120,7 @@ func runOnce(app: App, window: TimeInterval, json: Bool) {
         failIfNeverScanned(app)
         return
     }
-    print(Ansi.bold("blescan — \(devices.count) BLE devices  (adapter \(stateLabel(app.snapshotState())), permission \(authLabel(app.radio.authorization)))"))
+    print(Ansi.bold("blescan — \(devices.count) BLE devices\(app.filter.isEmpty && !app.connectableOnly && !app.namedOnly ? "" : " (filtered)")  (adapter \(stateLabel(app.snapshotState())), permission \(authLabel(app.radio.authorization)))"))
     if devices.isEmpty {
         print(Ansi.dim("No advertisements heard. Is Bluetooth on and the permission granted? Try `blescan --diag`."))
         return
@@ -1105,7 +1149,7 @@ func runStream(app: App, window: TimeInterval?) {
         if state == .poweredOff || state == .unauthorized || state == .unsupported { failIfNeverScanned(app) }
         app.prune(at: t, drop: 60)
         let live = app.snapshotDevices(at: t)
-        for d in live where d.lastSeen > (writtenSeen[d.id] ?? -1) && t - (writtenAt[d.id] ?? -1) >= 1 {
+        for d in app.visible(live) where d.lastSeen > (writtenSeen[d.id] ?? -1) && t - (writtenAt[d.id] ?? -1) >= 1 {
             let row = DeviceJSON(d, now: t, ts: iso.string(from: Date()))
             if let data = try? enc.encode(row), let s = String(data: data, encoding: .utf8) { print(s) }
             writtenAt[d.id] = t; writtenSeen[d.id] = d.lastSeen
@@ -1166,6 +1210,12 @@ func printHelp() {
     OPTIONS:
       --window N         seconds to scan in the headless modes (default 6; 3 for --diag;
                          unbounded for --stream). Also --window=N.
+      --sort KEY         rssi (default) · name · vendor · type · age · rate
+      --reverse          flip the sort direction
+      --filter TEXT      keep devices whose name, vendor or type contains TEXT
+      --connectable      keep only devices advertising as connectable
+      --named            keep only devices that advertise a name
+                         (the view flags seed the TUI too: `blescan --sort name --named`)
 
     --json and --stream exit 3 (with a line on stderr) when the adapter never powered on,
     so an empty result from a quiet room is distinguishable from a scan that never happened.
@@ -1173,8 +1223,9 @@ func printHelp() {
     Colour is automatic: on in a terminal, off when piped/redirected (or set NO_COLOR).
 
     TUI KEYS:
-      q / Ctrl-C / Ctrl-D quit · j/k (or ↑/↓) select · p/n/v/t/g/r sort (again to reverse)
-      c connectable-only · u named-only · / filter (Enter apply, Esc clear) · ? help
+      q / Ctrl-C / Ctrl-D quit · j/k (or ↑/↓) select · J/K scroll the detail pane
+      p/n/v/t/g/r sort (again to reverse) · c connectable-only · u named-only
+      / filter (Enter apply, Esc clear) · ? help
       mouse: wheel selects · click a header to sort · click a row to inspect
     """)
 }
@@ -1189,6 +1240,7 @@ func main() {
     Ansi.enabled = ProcessInfo.processInfo.environment["NO_COLOR"] == nil && isatty(STDOUT_FILENO) != 0
 
     let app = App()
+    app.apply(opts)
     switch opts.mode {
     case .help:    printHelp()
     case .version: print("blescan \(blescanVersion)")

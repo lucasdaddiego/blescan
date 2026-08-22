@@ -35,8 +35,11 @@ struct Fingerprint {
     let iBeacon: IBeacon?
     /// Parsed Eddystone frame from the 0xFEAA service-data entry, if present.
     let eddystone: Eddystone?
-    /// Apple "Continuity" advertisement segment types present (iBeacon, AirPods, Find My …).
+    /// Apple "Continuity" segment types seen from this peripheral — the union over every
+    /// packet heard, sorted, not just the latest one (see `Device.continuitySeen`).
     let continuityTypes: [UInt8]
+    /// Stable identity for beacons that rotate their random address (see `beaconKey`).
+    let beaconKey: String?
     /// Every service UUID source, normalised, as a set for quick membership tests.
     let serviceShortSet: Set<String>
     /// The services this device advertises, for listing: the service list first, then any
@@ -54,18 +57,20 @@ struct Fingerprint {
     let calibratedRSSIAt1m: Int?
 
     init(name: String?, manufacturerData: [UInt8], serviceUUIDs: [String],
-         serviceData: [ServiceDatum], solicitedUUIDs: [String], overflowUUIDs: [String]) {
+         serviceData: [ServiceDatum], solicitedUUIDs: [String], overflowUUIDs: [String],
+         continuitySeen: Set<UInt8>) {
         companyId = companyIdentifier(manufacturerData)
         vendor = vendorLabel(companyId)
         iBeacon = parseIBeacon(manufacturerData)
         eddystone = serviceData.first { normalizeUUID($0.uuid) == "FEAA" }.flatMap { parseEddystone($0.bytes) }
-        continuityTypes = appleSegmentTypes(manufacturerData)
+        continuityTypes = continuitySeen.sorted()
+        beaconKey = beaconIdentity(iBeacon: iBeacon, eddystone: eddystone)
         serviceShortSet = Set((serviceUUIDs + serviceData.map { $0.uuid } + solicitedUUIDs + overflowUUIDs).map(normalizeUUID))
         var seen = Set<String>()
         advertisedServices = (serviceUUIDs + serviceData.map { $0.uuid }).filter { seen.insert(normalizeUUID($0)).inserted }
         typeLabel = inferDeviceType(serviceShortUUIDs: serviceShortSet, companyId: companyId,
                                     iBeacon: iBeacon != nil, eddystone: eddystone != nil,
-                                    continuityTypes: Set(continuityTypes), name: name)
+                                    continuityTypes: continuitySeen, name: name)
         if let b = iBeacon { calibratedRSSIAt1m = b.measuredPower }
         else if let e = eddystone, let tx = e.txPower { calibratedRSSIAt1m = tx - 41 }
         else { calibratedRSSIAt1m = nil }
@@ -90,6 +95,14 @@ struct Device {
     var firstSeen: Double                         // monotonic seconds (see `now()` in main.swift)
     var lastSeen: Double                          // monotonic seconds
     var advertsPerSecond: Double                  // stamped by the app from its AdvertRate meter
+    /// The identifier this beacon was last seen under before its address rotated, when the
+    /// `IdentityLinker` matched it by `beaconKey`. App-managed, like `advertsPerSecond`.
+    var previousID: String?
+    /// Union of Apple Continuity segment types over every packet heard. An Apple device
+    /// alternates packet kinds — Nearby Info in one, Handoff in the next, Find My in a
+    /// third — so fingerprinting the LATEST manufacturer payload alone made the Type and
+    /// continuity cells flip from frame to frame. The union is the device's real signature.
+    private(set) var continuitySeen: Set<UInt8>
     private(set) var fingerprint: Fingerprint
 
     init(id: String, name: String?, rssi: Int, txPower: Int?, connectable: Bool?,
@@ -102,9 +115,11 @@ struct Device {
         self.solicitedUUIDs = solicitedUUIDs; self.overflowUUIDs = overflowUUIDs
         self.firstSeen = firstSeen; self.lastSeen = lastSeen
         self.advertsPerSecond = advertsPerSecond
+        continuitySeen = Set(appleSegmentTypes(manufacturerData))
         fingerprint = Fingerprint(name: name, manufacturerData: manufacturerData,
                                   serviceUUIDs: serviceUUIDs, serviceData: serviceData,
-                                  solicitedUUIDs: solicitedUUIDs, overflowUUIDs: overflowUUIDs)
+                                  solicitedUUIDs: solicitedUUIDs, overflowUUIDs: overflowUUIDs,
+                                  continuitySeen: continuitySeen)
     }
 
     /// Merge a fresh advertisement from the same peripheral, heard at `t`. Adverts and scan
@@ -123,11 +138,13 @@ struct Device {
         if !u.serviceData.isEmpty { take(&serviceData, u.serviceData) }
         if !u.solicitedUUIDs.isEmpty { take(&solicitedUUIDs, u.solicitedUUIDs) }
         if !u.overflowUUIDs.isEmpty { take(&overflowUUIDs, u.overflowUUIDs) }
+        if !u.continuitySeen.isSubset(of: continuitySeen) { continuitySeen.formUnion(u.continuitySeen); changed = true }
         lastSeen = t
         if changed {
             fingerprint = Fingerprint(name: name, manufacturerData: manufacturerData,
                                       serviceUUIDs: serviceUUIDs, serviceData: serviceData,
-                                      solicitedUUIDs: solicitedUUIDs, overflowUUIDs: overflowUUIDs)
+                                      solicitedUUIDs: solicitedUUIDs, overflowUUIDs: overflowUUIDs,
+                                      continuitySeen: continuitySeen)
         }
     }
 
@@ -141,6 +158,7 @@ struct Device {
     var advertisedServices: [String] { fingerprint.advertisedServices }
     var typeLabel: String { fingerprint.typeLabel }
     var calibratedRSSIAt1m: Int? { fingerprint.calibratedRSSIAt1m }
+    var beaconKey: String? { fingerprint.beaconKey }
 
     /// Proximity bucket (immediate / near / far / unknown) from RSSI + any 1 m reference.
     var proximityBucket: Proximity { proximity(rssi: rssi, calibratedRSSIAt1m: calibratedRSSIAt1m) }
@@ -169,12 +187,21 @@ func companyIdentifier(_ raw: [UInt8]) -> UInt16? {
     return UInt16(raw[0]) | (UInt16(raw[1]) << 8)
 }
 
+/// Highest company identifier the Bluetooth SIG had assigned when the table was last
+/// refreshed (company_identifiers.yaml, 2026-08-22). Ids above it are not a gap in our
+/// curated table — nobody has been issued them — so they are labelled as such.
+let sigMaxAssignedCompanyId: UInt16 = 0x110D
+
 /// Vendor label for a company id: the curated SIG name, else the raw hex id, else "—"
 /// for no manufacturer data at all. Unknown ids are shown honestly as `0xXXXX` rather
-/// than guessed — there is no OUI fallback on macOS (see the file header).
+/// than guessed — there is no OUI fallback on macOS (see the file header) — and an id
+/// beyond the SIG's assigned range is marked `unassigned`, so "not in our table" and "not
+/// a registered vendor at all" read differently.
 func vendorLabel(_ id: UInt16?) -> String {
     guard let id = id else { return "—" }
-    return companyName(id) ?? String(format: "0x%04X", id)
+    if let name = companyName(id) { return name }
+    let hex = String(format: "0x%04X", id)
+    return id > sigMaxAssignedCompanyId ? "\(hex) unassigned" : hex
 }
 
 // MARK: - iBeacon
@@ -199,6 +226,50 @@ func parseIBeacon(_ raw: [UInt8]) -> IBeacon? {
     let minor = UInt16(raw[22]) << 8 | UInt16(raw[23])
     let power = Int(Int8(bitPattern: raw[24]))
     return IBeacon(uuid: uuid, major: major, minor: minor, measuredPower: power)
+}
+
+// MARK: - Beacon identity across address rotation
+
+/// A key that survives the random-address rotation macOS surfaces as a brand-new
+/// CBPeripheral identifier (Apple and Google rotate roughly every 15 minutes, so a long
+/// `--stream` or TUI session sees the same AirTag as a procession of new ids). The payload
+/// a beacon exists to broadcast IS its identity: iBeacon UUID/major/minor, Eddystone-UID
+/// namespace/instance, an Eddystone-URL. EID rotates by design and TLM carries no identity,
+/// so those — and everything that isn't a beacon — get nil.
+func beaconIdentity(iBeacon: IBeacon?, eddystone: Eddystone?) -> String? {
+    if let b = iBeacon { return "ibeacon:\(b.uuid)/\(b.major)/\(b.minor)" }
+    switch eddystone {
+    case .uid(_, let ns, let inst): return "eddystone-uid:\(ns)/\(inst)"
+    case .url(_, let url):          return "eddystone-url:\(url)"
+    default:                        return nil
+    }
+}
+
+/// Remembers which peripheral id each beacon key was last heard under, so a beacon that
+/// reappears with a fresh id is linked to its previous self: the row inherits the old
+/// `firstSeen` (the "first heard" age survives the rotation) and records `previousID`.
+struct IdentityLinker {
+    private var last: [String: (id: String, firstSeen: Double)] = [:]
+
+    /// Call on every ingest; a dictionary lookup when nothing changed. Mutates `d` in place
+    /// when its key was last seen under a different id.
+    mutating func link(_ d: inout Device) {
+        guard let key = d.beaconKey else { return }
+        if let prior = last[key] {
+            if prior.id == d.id { return }
+            d.previousID = prior.id
+            d.firstSeen = min(d.firstSeen, prior.firstSeen)
+        }
+        last[key] = (d.id, d.firstSeen)
+    }
+
+    /// Drop the keys last seen under ids that have been pruned. A rotation hands over
+    /// while the old id is still in the table (the new address starts within seconds), so
+    /// once the old id has aged out the key has already moved to the new one — or the
+    /// beacon is genuinely gone. Without this the map grows with every rotation, forever.
+    mutating func forget(ids: Set<String>) {
+        last = last.filter { !ids.contains($0.value.id) }
+    }
 }
 
 // MARK: - Apple Continuity
@@ -333,10 +404,13 @@ func inferDeviceType(serviceShortUUIDs: Set<String>, companyId: UInt16?, iBeacon
     if has("FD6F") { return "Exposure Notification" }
     if has("FE2C") { return "Google Fast Pair" }
 
-    // Apple Continuity signatures (only meaningful for Apple manufacturer data).
-    if continuityTypes.contains(0x12) || has("FD44") || has("FD43") { return "Find My / AirTag" }
+    // Apple Continuity signatures (only meaningful for Apple manufacturer data). Find My
+    // frames alone mean a tag; a device that ALSO sends Nearby Info or Handoff is a phone,
+    // watch or Mac that happens to take part in the Find My network — `continuityTypes` is
+    // the union over every packet heard, which is what makes this distinction possible.
+    let phoneLike = continuityTypes.contains(0x10) || continuityTypes.contains(0x0C)
+    if (continuityTypes.contains(0x12) && !phoneLike) || has("FD44") || has("FD43") { return "Find My / AirTag" }
     if continuityTypes.contains(0x07) { return "AirPods / Apple audio" }
-    if companyId == 0x004C && !continuityTypes.isEmpty { return "Apple device" }
 
     // GATT primary-service signatures.
     if has("1812") { return "Keyboard / mouse (HID)" }
@@ -348,8 +422,57 @@ func inferDeviceType(serviceShortUUIDs: Set<String>, companyId: UInt16?, iBeacon
     if has("FE95") { return "Xiaomi device" }
     if has(nordicUARTService) { return "Nordic UART device" }
 
+    // The advertised name, when nothing more specific spoke.
+    if let hint = nameTypeHint(name) { return hint }
+    if companyId == 0x004C && !continuityTypes.isEmpty { return "Apple device" }
+
     if companyId != nil { return "BLE device" }
     return name?.isEmpty == false ? "BLE device" : "—"
+}
+
+/// Device category guessed from the advertised local name — a weaker signal than a beacon
+/// or GATT signature (so it is consulted after them) but far better than "BLE device" for
+/// the many consumer gadgets that advertise nothing but a name. Matched case-insensitively;
+/// short keys match whole words only so "tv" can't fire on "activity".
+private let nameHints: [(key: String, label: String, wholeWord: Bool)] = [
+    ("airtag", "Find My / AirTag", false),
+    ("airpods", "AirPods / Apple audio", false),
+    ("iphone", "iPhone", false), ("ipad", "iPad", false),
+    ("macbook", "Mac", false), ("imac", "Mac", false), ("mac mini", "Mac", false), ("mac studio", "Mac", false),
+    ("apple watch", "Watch", false), ("galaxy watch", "Watch", false), ("pixel watch", "Watch", false),
+    ("forerunner", "Watch", false), ("fenix", "Watch", false), ("venu", "Watch", false),
+    ("vivoactive", "Watch", false), ("instinct", "Watch", false), ("watch", "Watch", true),
+    ("tile", "Tile tracker", true), ("chipolo", "Tracker", false), ("pebblebee", "Tracker", false),
+    ("flic", "Flic button", false),
+    ("keyboard", "Keyboard / mouse (HID)", false), ("mouse", "Keyboard / mouse (HID)", true),
+    ("trackpad", "Keyboard / mouse (HID)", false),
+    ("dualsense", "Game controller", false), ("dualshock", "Game controller", false),
+    ("joy-con", "Game controller", false), ("pro controller", "Game controller", false),
+    ("xbox", "Game controller", false), ("controller", "Game controller", true),
+    ("buds", "Headphones / speaker", true), ("earbuds", "Headphones / speaker", false),
+    ("headphones", "Headphones / speaker", false), ("bose", "Headphones / speaker", true),
+    ("jbl", "Headphones / speaker", true), ("soundcore", "Headphones / speaker", false),
+    ("wh-", "Headphones / speaker", false), ("wf-", "Headphones / speaker", false),
+    ("beats", "Headphones / speaker", true), ("speaker", "Headphones / speaker", true),
+    ("sonos", "Speaker", false), ("homepod", "Speaker", false),
+    ("tv", "TV", true), ("bravia", "TV", false), ("chromecast", "TV", false), ("roku", "TV", false),
+    ("appletv", "TV", false), ("apple tv", "TV", false),
+    ("pixel", "Phone / tablet", true), ("galaxy", "Phone / tablet", true), ("oneplus", "Phone / tablet", false),
+    ("scale", "Scale", true),
+    ("hue", "Smart light", true), ("govee", "Smart light", false), ("nanoleaf", "Smart light", false),
+    ("ruuvi", "Environmental sensor", false),
+    ("printer", "Printer", false),
+    ("tesla", "Vehicle", false), ("model 3", "Vehicle", false), ("model y", "Vehicle", false),
+]
+
+func nameTypeHint(_ name: String?) -> String? {
+    guard let raw = name, !raw.isEmpty else { return nil }
+    let lower = raw.lowercased()
+    let words = Set(lower.split { !$0.isLetter && !$0.isNumber }.map(String.init))
+    for hint in nameHints where hint.wholeWord ? words.contains(hint.key) : lower.contains(hint.key) {
+        return hint.label
+    }
+    return nil
 }
 
 // MARK: - Proximity / distance
@@ -400,8 +523,23 @@ func proximity(rssi: Int, calibratedRSSIAt1m ref: Int?) -> Proximity {
 
 // MARK: - Sorting
 
-enum SortKey {
+enum SortKey: CaseIterable {
     case rssi, name, vendor, type, age, rate
+
+    /// Parse a `--sort` argument: the key's lowercase label, or the TUI's key letter
+    /// ("p" / "power" are accepted for RSSI to match the on-screen hint).
+    init?(argument: String) {
+        switch argument.lowercased() {
+        case "rssi", "power", "p": self = .rssi
+        case "name", "n":          self = .name
+        case "vendor", "v":        self = .vendor
+        case "type", "t":          self = .type
+        case "age", "g":           self = .age
+        case "rate", "r":          self = .rate
+        default: return nil
+        }
+    }
+
     var label: String {
         switch self {
         case .rssi:   return "RSSI"
@@ -757,10 +895,17 @@ func sanitizeName(_ s: String) -> String {
 enum Mode: Equatable { case tui, once, json, stream, diag, help, version }
 
 /// Parsed command line. `window` is the headless scan length in seconds when given
-/// (`--window N` / `--window=N`); each mode picks its own default otherwise.
+/// (`--window N` / `--window=N`); each mode picks its own default otherwise. The view
+/// options (`sort`, `reverse`, `filter`, toggles) apply to every mode: they seed the TUI's
+/// initial state and give the headless modes the same filtering without a `jq` step.
 struct Options: Equatable {
     var mode: Mode = .tui
     var window: Double?
+    var sort: SortKey = .rssi
+    var reverse = false
+    var filter = ""
+    var connectableOnly = false
+    var namedOnly = false
 }
 
 /// A command-line usage error: the message to print on stderr before exiting 2.
@@ -774,6 +919,15 @@ func parseArguments(_ args: [String]) -> Result<Options, UsageError> {
     var opts = Options()
     var modeFlag: String?
     var i = 0
+    /// The value of a `--flag VALUE` / `--flag=VALUE` option, or the usage error for a bare flag.
+    func value(of flag: String, _ a: String) -> Result<String, UsageError> {
+        if a != flag { return .success(String(a.dropFirst(flag.count + 1))) }
+        guard i < args.count else {
+            return .failure(UsageError(message: "error: \(flag) needs a value (see --help)"))
+        }
+        defer { i += 1 }
+        return .success(args[i])
+    }
     while i < args.count {
         let a = args[i]; i += 1
         if a == "--help" || a == "-h" { return .success(Options(mode: .help)) }
@@ -784,24 +938,55 @@ func parseArguments(_ args: [String]) -> Result<Options, UsageError> {
             }
             opts.mode = m; modeFlag = a
         } else if a == "--window" || a.hasPrefix("--window=") {
-            let raw: String
-            if a == "--window" {
-                guard i < args.count else {
-                    return .failure(UsageError(message: "error: --window needs a number of seconds (see --help)"))
-                }
-                raw = args[i]; i += 1
-            } else {
-                raw = String(a.dropFirst("--window=".count))
+            guard case .success(let raw) = value(of: "--window", a) else {
+                return .failure(UsageError(message: "error: --window needs a number of seconds (see --help)"))
             }
             guard let w = Double(raw), w.isFinite, w > 0 else {
                 return .failure(UsageError(message: "error: --window must be a positive number of seconds, got '\(raw)'"))
             }
             opts.window = w
+        } else if a == "--sort" || a.hasPrefix("--sort=") {
+            guard case .success(let raw) = value(of: "--sort", a) else {
+                return .failure(UsageError(message: "error: --sort needs a key: rssi, name, vendor, type, age or rate (see --help)"))
+            }
+            guard let key = SortKey(argument: raw) else {
+                return .failure(UsageError(message: "error: --sort must be one of rssi, name, vendor, type, age, rate — got '\(raw)'"))
+            }
+            opts.sort = key
+        } else if a == "--filter" || a.hasPrefix("--filter=") {
+            guard case .success(let raw) = value(of: "--filter", a) else {
+                return .failure(UsageError(message: "error: --filter needs a substring to match (see --help)"))
+            }
+            opts.filter = raw
+        } else if a == "--reverse" {
+            opts.reverse = true
+        } else if a == "--connectable" {
+            opts.connectableOnly = true
+        } else if a == "--named" {
+            opts.namedOnly = true
         } else {
             return .failure(UsageError(message: "error: unknown option '\(a)' (see --help)"))
         }
     }
     return .success(opts)
+}
+
+/// The TUI's view of a device list: the toggles, the substring filter (name / vendor /
+/// type, case-insensitive) and the sort — shared with the headless modes so `--filter`,
+/// `--connectable`, `--named` and `--sort` mean exactly what the keys do.
+func applyView(_ devices: [Device], filter: String, connectableOnly: Bool, namedOnly: Bool,
+               sort: SortKey, ascending: Bool) -> [Device] {
+    var f = devices
+    if connectableOnly { f = f.filter { $0.connectable == true } }
+    if namedOnly { f = f.filter { $0.isNamed } }
+    if !filter.isEmpty {
+        let q = filter.lowercased()
+        f = f.filter {
+            $0.displayName.lowercased().contains(q) || $0.vendor.lowercased().contains(q)
+                || $0.typeLabel.lowercased().contains(q)
+        }
+    }
+    return sortDevices(f, by: sort, ascending: ascending)
 }
 
 // MARK: - Headless scan outcome

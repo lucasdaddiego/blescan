@@ -120,7 +120,9 @@ TUI — nothing to install, and nothing between you and the raw advert bytes.
 ## Requirements
 
 - **macOS** (built & tested on **macOS 26 / Apple Silicon**; targets macOS 12+).
-- **Xcode Command Line Tools** for `swiftc` — `xcode-select --install`.
+- **Xcode 16+ Command Line Tools** for `swiftc` — `xcode-select --install`. The code is
+  in Swift 6 language mode, so a Swift 6 toolchain is required to build (running the
+  binary needs only macOS 12+).
 - A Bluetooth radio that's turned on. That's it — no Homebrew formulae, no Swift packages.
 
 > **Linux / Windows:** **N/A.** CoreBluetooth is macOS‑only; a Linux port would be an
@@ -133,6 +135,12 @@ TUI — nothing to install, and nothing between you and the raw advert bytes.
 make install    # build + sign the optimised `blescan` binary into ~/.bin
 make uninstall  # remove it
 ```
+
+Or grab the universal (Apple Silicon + Intel) zip from the
+[latest release](https://github.com/lucasdaddiego/blescan/releases/latest), then
+`xattr -d com.apple.quarantine blescan` (it's ad‑hoc signed, so Gatekeeper quarantines the
+download) and put it on your `PATH`. Building from source skips the quarantine step and,
+with a personal certificate, keeps the Bluetooth grant across upgrades (below).
 
 `make install` compiles an optimised, fully‑stripped binary (no debug info), **embeds the
 `Info.plist`** into the Mach‑O (so a bundle‑less CLI can still request Bluetooth — see
@@ -181,6 +189,9 @@ blescan --stream         # NDJSON, one line per device per packet, until killed
 blescan --diag           # adapter + permission diagnostics
 blescan --json --window 20      # any headless mode: scan for 20 s instead
 blescan --stream --window=60    # …or stream for a minute, then exit
+blescan --json --named --sort name          # the TUI's filters + sort, headless
+blescan --once --filter airtag --connectable
+blescan --sort rate --reverse   # the same flags seed the TUI's initial view
 blescan --version        # print the version
 blescan --help           # usage summary
 ```
@@ -192,6 +203,9 @@ blescan --help           # usage summary
 | `--stream` | Emit [NDJSON](#json-output) for as long as the process runs — one line per device per packet, throttled to one line per device per second. Exit 3 if the adapter never powers on. |
 | `--diag` | Print version, adapter state, permission status and device/name counts (3 s scan). |
 | `--window N` | Seconds to scan in the headless modes (`--window=N` works too). For `--stream`, a stop time instead of running forever. |
+| `--sort KEY` | `rssi` (default), `name`, `vendor`, `type`, `age` or `rate` — the TUI's sort keys, for any mode. `--reverse` flips it. |
+| `--filter TEXT` | Keep devices whose name, vendor or type contains `TEXT` (case‑insensitive) — what `/` does in the TUI. |
+| `--connectable`, `--named` | The TUI's `c` / `u` toggles. |
 | `--version`, `-V` | Print the version. |
 | `--help`, `-h` | Show usage. |
 
@@ -205,8 +219,8 @@ to force it off. **Truecolor** is used when the terminal advertises it
 | Column | Meaning |
 |--------|---------|
 | **Name** | Advertised local name (or the cached GAP name). `(unnamed)` if the device advertises none. |
-| **Vendor** | Manufacturer, from the 2‑byte company identifier in manufacturer data. An unknown id is shown honestly as `0xXXXX`; `—` means no manufacturer data at all. |
-| **Type** | Best‑guess device category from services + manufacturer signature (see [fingerprinting](#how-the-fingerprinting-works)). |
+| **Vendor** | Manufacturer, from the 2‑byte company identifier in manufacturer data. An id the SIG has assigned but the curated table doesn't name is shown honestly as `0xXXXX`; one beyond the SIG's assigned range is `0xXXXX unassigned` (the device is using an id nobody holds); `—` means no manufacturer data at all. |
+| **Type** | Best‑guess device category from beacon / Continuity / service signatures, then the advertised name (see [fingerprinting](#how-the-fingerprinting-works)). |
 | **dBm** | RSSI / signal power. Closer to 0 is stronger (`-41` ≫ `-89`). `—` if unavailable. |
 | **Signal** | Colour bar of the same value. |
 | **Prox** | Proximity estimate: **immediate / near / far**, or `—` when not estimable. |
@@ -227,9 +241,14 @@ The bottom pane expands the **selected** device (move the selection with `j`/`k`
 arrows, the mouse wheel, or by clicking a row). It shows the host‑stable identifier, the
 full signal line (RSSI, proximity, estimated distance when a calibration is present, TX
 power, connectable, age, when it was first heard, advert rate), vendor and type, the
-**resolved service list**, any decoded
-**iBeacon / Eddystone / Continuity** payloads, and a **hex dump of the raw manufacturer
-and service‑data bytes** — the advertisement exactly as it came off the air.
+**resolved service list**, any decoded **iBeacon / Eddystone / Continuity** payloads, and a
+**hex dump of the raw manufacturer and service‑data bytes** — the advertisement exactly as
+it came off the air. A beacon whose random address has rotated also shows the id it was
+**previously** heard under (see [fingerprinting](#how-the-fingerprinting-works)).
+
+The pane takes up to a third of the screen; when a device's detail runs longer than that
+(several service‑data hex dumps, say) the rule above it reads `detail 1–8 of 14` and
+**`J` / `K`** — or the mouse wheel over the pane — scroll it.
 
 ## Keyboard shortcuts
 
@@ -237,6 +256,7 @@ and service‑data bytes** — the advertisement exactly as it came off the air.
 |-----|--------|-|-----|--------|
 | `q` / `Ctrl‑C` / `Ctrl‑D` | quit (also mid‑filter) | | `p` | sort by **p**ower (RSSI) |
 | `j` / `k` / `↓` / `↑` | move selection | | `n` | sort by **n**ame |
+| `J` / `K` | scroll the detail pane | | | |
 | `c` | **c**onnectable‑only toggle | | `v` | sort by **v**endor |
 | `u` | named‑only toggle | | `t` | sort by **t**ype |
 | `/` | **filter** (Enter apply, Esc clear) | | `g` | sort by a**g**e |
@@ -269,15 +289,34 @@ identity is built entirely from the **advertisement** itself:
    (namespace/instance), **URL** (expanded from its compressed form), **TLM** (battery,
    temperature, advertising count, uptime) and **EID**.
 4. **Apple Continuity.** The TLV segment stream is walked to recognise **AirPods /
-   Proximity Pairing**, **Handoff**, **Nearby**, **Find My**, AirDrop, and friends.
+   Proximity Pairing**, **Handoff**, **Nearby**, **Find My**, AirDrop, and friends. The
+   segment types are **accumulated across packets** — an iPhone sends Nearby Info in one
+   advert and a Find My frame in the next, so judging the latest packet alone made its
+   Type flip between "Apple device" and "Find My / AirTag" from frame to frame. The union
+   is the device's real signature: Find My *alone* is a tag; Find My alongside Nearby /
+   Handoff is a phone, watch or Mac taking part in the Find My network.
 5. **Service UUIDs.** Well‑known SIG services map both to friendly names and to a
    **device‑type guess** — Heart Rate → *heart‑rate monitor*, HID → *keyboard/mouse*,
    Cycling Power / Fitness Machine → *fitness sensor*, Environmental Sensing → *sensor*,
    Mesh Provisioning/Proxy → *mesh node*, Tile / Exposure Notification / Fast Pair, etc.
-6. **Proximity.** When the advertisement carries a calibrated reference (the iBeacon 1 m
+6. **Name.** When nothing above spoke, the advertised local name is matched against a
+   small table of consumer‑gadget keywords (AirPods, Forerunner, WH‑1000XM5, Galaxy Watch,
+   Magic Mouse, Bravia, Chipolo, Flic, Hue, …) — a weaker signal than a beacon or GATT
+   signature, hence last, but it lifts many rows out of plain "BLE device". Short keys
+   match whole words only, so `tv` can't fire on *activity*.
+7. **Proximity.** When the advertisement carries a calibrated reference (the iBeacon 1 m
    measured power, or an Eddystone TX power), `blescan` runs the standard path‑loss curve
    to bucket distance; otherwise it falls back to RSSI thresholds. It's a **rough
    estimate**, not a measurement — radio environment dominates.
+8. **Identity across address rotation.** Apple and Google rotate a device's random BLE
+   address every ~15 minutes, and macOS surfaces each rotation as a brand‑new peripheral
+   identifier — so a long session sees the same AirTag as a procession of new rows. For
+   beacons the payload *is* the identity: the iBeacon UUID/major/minor, an Eddystone‑UID
+   namespace/instance or an Eddystone‑URL becomes a **`beaconKey`**, and a new id carrying
+   a known key is linked to its predecessor — the row inherits the original first‑heard
+   time and the detail pane / JSON record the **previous id**. (Eddystone‑EID rotates by
+   design and TLM carries no identity, so they aren't linked; neither is anything that
+   isn't a beacon — there is nothing stable to link on.)
 
 All of this lives in the framework‑free `Core.swift`, unit‑tested at **100% coverage**.
 
@@ -298,6 +337,7 @@ one‑line reason goes to stderr and the exit status is **3** — so a script ne
 [
   {
     "advertsPerSecond": 2.4,
+    "beaconKey": "ibeacon:F7826DA6-4FA2-4E98-8024-BC5B71E0893E/1/2",   // beacons only
     "companyId": "0x004C",
     "connectable": true,
     "continuity": ["AirPods / Proximity Pairing"],
@@ -306,6 +346,7 @@ one‑line reason goes to stderr and the exit status is **3** — so a script ne
     "lastSeenSecondsAgo": 0,
     "manufacturerHex": "4c000719...",
     "name": "Lucas’ AirPods",
+    "previousId": "0E2B9C44-…",          // only after an address rotation was linked
     "proximity": "immediate",
     "rssi": -41,
     "serviceNames": ["Battery (0x180F)"],
@@ -327,6 +368,12 @@ Example — everything advertising the Battery service:
 
 ```sh
 blescan --json | jq -c '.[] | select(.services | index("180F")) | {name, vendor, rssi}'
+```
+
+The TUI's view flags work here too, which usually saves the `jq`:
+
+```sh
+blescan --json --named --sort name --filter garmin
 ```
 
 ### Streaming (`--stream`)
@@ -425,6 +472,7 @@ Sources/blescan/main.swift   CoreBluetooth (Radio) · TUI · entrypoint
 Tests/CoreTests.swift        dependency-free unit tests for Core (`make test`, 100% covered)
 scripts/check-coverage.sh    coverage gate — fails unless Core.swift is 100% region+line covered
 .github/workflows/ci.yml     GitHub Actions: debug + release build, tests, coverage gate on every push/PR
+.github/workflows/release.yml GitHub Actions: on a v* tag, `make dist` → universal zip → GitHub release
 Info.plist                   Bluetooth usage string, embedded into the binary at link time
 Makefile                     `make install` → signed blescan in ~/.bin; `make test` / `make coverage`
 Package.swift                SwiftPM manifest (for editors/tooling/CI; the Makefile uses swiftc)
@@ -443,8 +491,14 @@ make build                 # build + sign ./blescan locally, no install (quick c
 make run ARGS=--diag       # build, then run ./blescan with flags (≡ make diag)
 make test                  # run the core unit tests (no Xcode/XCTest needed — CLT only)
 make coverage              # run tests under llvm-cov; fails unless Core.swift is 100% covered
+make dist                  # universal (arm64 + x86_64) signed binary + zip in .build/dist
+make release               # tag v<Info.plist version> and push it; CI builds + publishes the release
 make clean                 # remove build artifacts (make uninstall removes ~/.bin/blescan)
 ```
+
+**Releasing:** bump `CFBundleShortVersionString` in `Info.plist`, commit, `make release`.
+The tag triggers `release.yml`, which checks the tag against the plist and the binary's own
+`--version`, runs the tests, builds the universal zip and publishes it with generated notes.
 
 Two files: **`Core.swift`** holds the pure, framework‑free logic (fingerprinting, the
 advert merge rules, the rate meter, proximity, colour, sorting, hex dump, text layout,
