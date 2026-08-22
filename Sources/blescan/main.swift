@@ -34,8 +34,6 @@ final class Radio: NSObject, CBCentralManagerDelegate {
     /// Called on the BLE queue whenever the adapter state changes.
     var onState: ((CBManagerState) -> Void)?
 
-    private(set) var state: CBManagerState = .unknown
-
     func start() {
         // ShowPowerAlert surfaces the system "Bluetooth is off" alert if appropriate.
         central = CBCentralManager(delegate: self, queue: queue,
@@ -57,7 +55,6 @@ final class Radio: NSObject, CBCentralManagerDelegate {
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        state = central.state
         onState?(central.state)
         if central.state == .poweredOn {
             // allowDuplicates is ESSENTIAL: without it CoreBluetooth coalesces a device to
@@ -81,8 +78,11 @@ private func buildDevice(_ p: CBPeripheral, _ adv: [String: Any], _ rssi: NSNumb
     let mfg = (adv[CBAdvertisementDataManufacturerDataKey] as? Data).map { [UInt8]($0) } ?? []
     let services = (adv[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?
         .map { normalizeUUID($0.uuidString) } ?? []
+    // A dictionary, so CoreBluetooth hands the entries back in hash order — sort them, or
+    // the detail pane / JSON list them in a different order from one advert to the next.
     let serviceData = (adv[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data])?
-        .map { ServiceDatum(uuid: normalizeUUID($0.key.uuidString), bytes: [UInt8]($0.value)) } ?? []
+        .map { ServiceDatum(uuid: normalizeUUID($0.key.uuidString), bytes: [UInt8]($0.value)) }
+        .sorted { $0.uuid < $1.uuid } ?? []
     let solicited = (adv[CBAdvertisementDataSolicitedServiceUUIDsKey] as? [CBUUID])?
         .map { normalizeUUID($0.uuidString) } ?? []
     let overflow = (adv[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID])?
@@ -98,7 +98,7 @@ private func buildDevice(_ p: CBPeripheral, _ adv: [String: Any], _ rssi: NSNumb
         serviceData: serviceData,
         solicitedUUIDs: solicited,
         overflowUUIDs: overflow,
-        firstSeen: 0, lastSeen: 0)   // timestamps stamped by App.ingest
+        firstSeen: 0, lastSeen: 0)   // stamped by App.ingest
 }
 
 func stateLabel(_ s: CBManagerState) -> String {
@@ -148,7 +148,6 @@ enum Ansi {
     }
     static func bold(_ s: String) -> String { wrap(s, "1") }
     static func dim(_ s: String) -> String { wrap(s, "2") }
-    static func reverse(_ s: String) -> String { wrap(s, "7") }
     static func fg256(_ s: String, _ c: Int) -> String { wrap(s, "38;5;\(c)") }
     static func bg256(_ s: String, _ c: Int) -> String { wrap(s, "48;5;\(c)") }
 
@@ -257,18 +256,25 @@ func termSize() -> Layout {
 
 /// Table column widths (Name flexes; Trend appears only when the window is wide enough).
 /// Shared by renderTable and tableSortRegions so the layout and the click hit-test agree.
-private func tableColWidths(_ cols: Int) -> (name: Int, vendor: Int, type: Int, dbm: Int,
-                                             bar: Int, prox: Int, conn: Int, age: Int, trend: Int) {
-    let vendor = 16, type = 18, dbm = 5, bar = 10, prox = 9, conn = 4, age = 4
-    // Trend (historyLen wide) needs the fixed columns + 8 separators + a min 14-wide Name
-    // to still fit, i.e. 14 + 66 + historyLen + 8 = 112. Turning it on any earlier just
-    // overflows the row (the table is clipped to `cols`, but we'd lose other columns).
-    let trend = cols >= (14 + 66 + App.historyLen + 8) ? App.historyLen : 0
-    let nCols = trend > 0 ? 9 : 8
-    let fixed = vendor + type + dbm + bar + prox + conn + age + trend + (nCols - 1)
-    let name = max(14, min(30, cols - fixed))
-    return (name, vendor, type, dbm, bar, prox, conn, age, trend)
+private func tableColWidths(_ cols: Int) -> (name: Int, vendor: Int, type: Int, dbm: Int, bar: Int,
+                                             prox: Int, conn: Int, age: Int, rate: Int, trend: Int) {
+    // Type is sized to the longest label ("Keyboard / mouse (HID)", 22) so no category is
+    // ever cut mid-word; Vendor is not — company names run long and Name needs the room.
+    let vendor = 16, type = 22, dbm = 5, bar = 10, prox = 9, conn = 4, age = 4, rate = 5
+    let fixed = vendor + type + dbm + bar + prox + conn + age + rate
+    let minName = 14
+    // Trend (historyLen wide) appears only once it fits alongside a minimum-width Name and
+    // the one-space separators (9 boundaries with Trend on). Turning it on any earlier just
+    // overflows the row — the table is clipped to `cols`, so we'd lose other columns.
+    let trend = cols >= minName + fixed + App.historyLen + 9 ? App.historyLen : 0
+    let separators = trend > 0 ? 9 : 8
+    let name = max(minName, min(30, cols - fixed - trend - separators))
+    return (name, vendor, type, dbm, bar, prox, conn, age, rate, trend)
 }
+
+/// Narrowest row the table can draw without clipping: a minimum-width Name plus the fixed
+/// columns and separators. Below this the row is clipped to the terminal, never wrapped.
+let tableMinCols = 14 + 75 + 8
 
 /// x-ranges (1-based screen columns) of each header cell paired with the sort key a
 /// click selects. Order mirrors renderTable's columns.
@@ -276,7 +282,7 @@ func tableSortRegions(_ cols: Int) -> [(range: ClosedRange<Int>, key: SortKey)] 
     let w = tableColWidths(cols)
     var order: [(Int, SortKey)] = [
         (w.name, .name), (w.vendor, .vendor), (w.type, .type), (w.dbm, .rssi),
-        (w.bar, .rssi), (w.prox, .rssi), (w.conn, .rssi), (w.age, .age),
+        (w.bar, .rssi), (w.prox, .rssi), (w.conn, .rssi), (w.age, .age), (w.rate, .rate),
     ]
     if w.trend > 0 { order.append((w.trend, .rssi)) }
     var regions: [(range: ClosedRange<Int>, key: SortKey)] = []
@@ -296,21 +302,21 @@ private func connCell(_ c: Bool?) -> String {
     }
 }
 
-/// Render the device table. Returns the lines (header first) plus the device id rendered
-/// on each data line (for click-to-select). `selectedID` highlights its row.
+/// Render the device table for the rows handed in — the caller passes just the viewport,
+/// not every visible device, so a room of 200 devices costs 30 rendered rows, not 200.
+/// Returns the lines, header first. `selectedID` highlights its row.
 private func renderTable(_ devices: [Device], cols: Int, now t: Double,
-                         history: [String: [Int]], selectedID: String?) -> (lines: [String], ids: [String]) {
+                         history: [String: [Int]], selectedID: String?) -> [String] {
     let w = tableColWidths(cols)
     var out: [String] = []
-    var ids: [String] = []
 
     var header = [
         padTo("Name", w.name), padTo("Vendor", w.vendor), padTo("Type", w.type),
         padLeft("dBm", w.dbm), padTo("Signal", w.bar), padTo("Prox", w.prox),
-        padTo("Conn", w.conn), padLeft("Age", w.age),
+        padTo("Conn", w.conn), padLeft("Age", w.age), padLeft("Adv/s", w.rate),
     ]
     if w.trend > 0 { header.append(padTo("Trend", w.trend)) }
-    // Clip to the terminal width: the columns have a ~87-cell floor, so on a narrow
+    // Clip to the terminal width: the columns have a `tableMinCols` floor, so on a narrow
     // terminal the row would otherwise overrun and wrap, tearing the whole frame.
     out.append(clipAnsi(Ansi.bold(Ansi.fg256(header.joined(separator: " "), Pal.text)), cols))
 
@@ -330,7 +336,9 @@ private func renderTable(_ devices: [Device], cols: Int, now t: Double,
         let prox = padTo(proximityColored(d.proximityBucket), w.prox, visibleWidth: displayWidth(d.proximityBucket.label))
         let conn = padTo(connCell(d.connectable), w.conn, visibleWidth: connVisibleWidth(d.connectable))
         let age = padLeft(formatAge(d.age(now: t)), w.age)
-        var cells = [name, vendor, type, dbm, bar, prox, conn, age]
+        let rateStr = formatRate(d.advertsPerSecond)
+        let rate = d.advertsPerSecond > 0 ? padLeft(rateStr, w.rate) : Ansi.dim(padLeft(rateStr, w.rate))
+        var cells = [name, vendor, type, dbm, bar, prox, conn, age, rate]
         if w.trend > 0 {
             // Fall back to the current reading only when it's a real RSSI — never seed the
             // trend with the 127 "unavailable" sentinel (it would render as a full spike).
@@ -348,9 +356,8 @@ private func renderTable(_ devices: [Device], cols: Int, now t: Double,
             row = clipAnsi(row, cols)
         }
         out.append(row)
-        ids.append(d.id)
     }
-    return (out, ids)
+    return out
 }
 
 /// padTo for a string that already carries ANSI escapes: pad by the KNOWN visible width
@@ -381,11 +388,13 @@ private func renderDetail(_ d: Device, cols: Int, now t: Double) -> [String] {
     sig += Ansi.fg256("   conn ", Pal.label) + connCell(d.connectable)
     if let tx = d.txPower { sig += Ansi.fg256("   tx ", Pal.label) + "\(tx) dBm" }
     sig += Ansi.fg256("   seen ", Pal.label) + formatAge(d.age(now: t)) + " ago"
+        + Ansi.dim("  (first \(formatAge(d.seenFor(now: t))) ago)")
+    sig += Ansi.fg256("   adv/s ", Pal.label) + formatRate(d.advertsPerSecond)
     out.append(field("signal", sig))
 
     out.append(field("vendor", "\(sanitizeName(d.vendor))   " + Ansi.dim("type ") + d.typeLabel))
 
-    let services = (d.serviceUUIDs + d.serviceData.map { $0.uuid }).map(friendlyService)
+    let services = d.advertisedServices.map(friendlyService)
     if !services.isEmpty { out.append(field("services", services.joined(separator: ", "))) }
     if !d.solicitedUUIDs.isEmpty {
         out.append(field("solicited", d.solicitedUUIDs.map(friendlyService).joined(separator: ", ")))
@@ -422,6 +431,7 @@ final class App {
     private var devices: [String: Device] = [:]
     private var history: [String: [Int]] = [:]
     private var lastHist: [String: Double] = [:]
+    private var rates: [String: AdvertRate] = [:]
     var generation = 0
     var radioState: CBManagerState = .unknown
 
@@ -437,10 +447,12 @@ final class App {
     var selectedID: String?
     var scroll = 0
     var quit = false
+    var helpShown = false
     var spinnerTick = 0
 
-    // --- render cache (main-thread-confined) ---
-    var lastFrame = ""
+    // --- render cache (main-thread-confined): the last painted frame, one entry per screen
+    // row, so draw() can rewrite only the rows that changed ---
+    var lastLines: [String] = []
     var lastCols = 0
     var lastRows = 0
     var lastTitle = ""
@@ -455,22 +467,13 @@ final class App {
     /// Merge one discovery into the live table (called on the BLE queue).
     func ingest(_ d: Device, at t: Double) {
         lock.lock(); defer { lock.unlock() }
-        if var e = devices[d.id] {
-            if let n = d.name { e.name = n }                  // keep the last name we heard
-            e.rssi = d.rssi
-            if let tx = d.txPower { e.txPower = tx }
-            if let c = d.connectable { e.connectable = c }
-            if !d.manufacturerData.isEmpty { e.manufacturerData = d.manufacturerData }
-            if !d.serviceUUIDs.isEmpty { e.serviceUUIDs = d.serviceUUIDs }
-            if !d.serviceData.isEmpty { e.serviceData = d.serviceData }
-            if !d.solicitedUUIDs.isEmpty { e.solicitedUUIDs = d.solicitedUUIDs }
-            if !d.overflowUUIDs.isEmpty { e.overflowUUIDs = d.overflowUUIDs }
-            e.lastSeen = t
-            devices[d.id] = e
+        if devices[d.id] != nil {
+            devices[d.id]!.absorb(d, at: t)   // in place: no copy of the row per advert
         } else {
             var nd = d; nd.firstSeen = t; nd.lastSeen = t
             devices[d.id] = nd
         }
+        rates[d.id, default: AdvertRate()].record(at: t)
         // Throttle the sparkline history to ~1 Hz per device so the trace spans seconds,
         // not the sub-second burst rate allow-duplicates delivers. Skip the 127 "RSSI
         // unavailable" sentinel so it never shows up as a full-height spike in the trend.
@@ -490,7 +493,7 @@ final class App {
         lock.lock(); defer { lock.unlock() }
         let dead = devices.filter { t - $0.value.lastSeen > drop }.map { $0.key }
         guard !dead.isEmpty else { return false }
-        for id in dead { devices[id] = nil; history[id] = nil; lastHist[id] = nil }
+        for id in dead { devices[id] = nil; history[id] = nil; lastHist[id] = nil; rates[id] = nil }
         generation += 1
         return true
     }
@@ -499,9 +502,20 @@ final class App {
     func markDirty() { lock.lock(); generation += 1; lock.unlock() }
     func readGeneration() -> Int { lock.lock(); defer { lock.unlock() }; return generation }
     func snapshotState() -> CBManagerState { lock.lock(); defer { lock.unlock() }; return radioState }
-    func snapshotDevices() -> [Device] { lock.lock(); defer { lock.unlock() }; return Array(devices.values) }
-    func deviceCount() -> Int { lock.lock(); defer { lock.unlock() }; return devices.count }
-    func historyCopy() -> [String: [Int]] { lock.lock(); defer { lock.unlock() }; return history }
+    /// Every device, each stamped with its advert rate as of `t` (the rate decays between
+    /// packets, so it is evaluated at read time rather than stored at ingest).
+    func snapshotDevices(at t: Double) -> [Device] {
+        lock.lock(); defer { lock.unlock() }
+        return devices.values.map { var d = $0; d.advertsPerSecond = rates[d.id]?.perSecond(at: t) ?? 0; return d }
+    }
+    /// Sparkline history for just the given ids — the rows about to be painted — instead of
+    /// copying every device's ring buffer under the lock each frame.
+    func history(for ids: [String]) -> [String: [Int]] {
+        lock.lock(); defer { lock.unlock() }
+        var out: [String: [Int]] = [:]
+        for id in ids { if let h = history[id] { out[id] = h } }
+        return out
+    }
 
     /// Filtered + sorted devices for display.
     func visible(_ all: [Device]) -> [Device] {
@@ -614,7 +628,13 @@ private func leaveRawFromSignal() {
 struct MouseEvent { let button: Int; let col: Int; let row: Int; let press: Bool }
 enum Input { case key(Character), mouse(MouseEvent), up, down, none }
 
+/// One byte of lookahead: readInput peeks past an ESC to tell a lone Escape from a CSI/SS3
+/// sequence, and when the next byte turns out to be an ordinary key (Esc then `q`, typed
+/// fast) it goes here so the key is delivered on the next read instead of being swallowed.
+private var pushedBack: UInt8?
+
 private func readByte() -> UInt8? {
+    if let b = pushedBack { pushedBack = nil; return b }
     var b: UInt8 = 0
     return read(STDIN_FILENO, &b, 1) == 1 ? b : nil
 }
@@ -625,7 +645,9 @@ private func readInput() -> Input {
         return b < 0x80 ? .key(Character(UnicodeScalar(b))) : .none
     }
     guard let b1 = readByte() else { return .key("\u{1B}") }   // lone Esc
-    guard b1 == 0x5B /* [ */ else { _ = readByte(); return .none }
+    // CSI (ESC [ …) or SS3 (ESC O …): arrows arrive as the latter in application-cursor
+    // mode (tmux and some terminals), with the same final byte.
+    guard b1 == 0x5B /* [ */ || b1 == 0x4F /* O */ else { pushedBack = b1; return .key("\u{1B}") }
     var body = [UInt8]()
     for _ in 0..<32 {
         guard let c = readByte() else { break }
@@ -666,7 +688,7 @@ func runInteractive(app: App) {
     app.wireRadio()
     app.radio.start()
 
-    var lastGen = -1, lastCols = 0, lastRows = 0, lastPrune = now()
+    var lastGen = -1, lastCols = 0, lastRows = 0, lastPrune = now(), lastSpin = now()
 
     while !app.quit {
         let t = now()
@@ -675,8 +697,11 @@ func runInteractive(app: App) {
         let sz = termSize()
         let gen = app.readGeneration()
         let scanning = app.snapshotState() == .poweredOn
-        if scanning { app.spinnerTick &+= 1 }
-        if gen != lastGen || sz.cols != lastCols || sz.rows != lastRows || scanning {
+        // The spinner / clock / ages tick at 5 Hz while scanning; the table itself repaints
+        // whenever the generation advances (new advert, key, prune) or the window resizes.
+        var animate = false
+        if scanning, t - lastSpin >= 0.2 { app.spinnerTick &+= 1; lastSpin = t; animate = true }
+        if gen != lastGen || sz.cols != lastCols || sz.rows != lastRows || animate {
             draw(app)
             lastGen = gen; lastCols = sz.cols; lastRows = sz.rows
         }
@@ -693,7 +718,7 @@ func runInteractive(app: App) {
 }
 
 private func moveSelection(_ app: App, _ delta: Int) {
-    let vis = app.visible(app.snapshotDevices())
+    let vis = app.visible(app.snapshotDevices(at: now()))
     guard !vis.isEmpty else { app.selectedID = nil; return }
     let idx = vis.firstIndex { $0.id == app.selectedID } ?? 0
     let next = max(0, min(vis.count - 1, idx + delta))
@@ -701,6 +726,13 @@ private func moveSelection(_ app: App, _ delta: Int) {
 }
 
 func handleKey(_ k: Character, app: App) {
+    if k == "\u{03}" || k == "\u{04}" { app.quit = true; return }   // Ctrl-C / Ctrl-D, anywhere
+    if app.helpShown {
+        // Any key dismisses the overlay; `q` still quits rather than needing a second press.
+        app.helpShown = false
+        app.markDirty()
+        if k != "q" { return }
+    }
     if app.filterEditing {
         switch k {
         case "\r", "\n": app.filterEditing = false
@@ -713,7 +745,7 @@ func handleKey(_ k: Character, app: App) {
         return
     }
     switch k {
-    case "q", "\u{04}", "\u{03}": app.quit = true          // q / Ctrl-D / Ctrl-C
+    case "q": app.quit = true
     case "j": moveSelection(app, 1)
     case "k": moveSelection(app, -1)
     case "p": setSort(app, .rssi)
@@ -721,6 +753,8 @@ func handleKey(_ k: Character, app: App) {
     case "v": setSort(app, .vendor)
     case "t": setSort(app, .type)
     case "g": setSort(app, .age)
+    case "r": setSort(app, .rate)
+    case "?": app.helpShown = true
     case "c": app.connectableOnly.toggle()
     case "u": app.namedOnly.toggle()
     case "/": app.filterEditing = true
@@ -731,6 +765,10 @@ func handleKey(_ k: Character, app: App) {
 }
 
 func handleMouse(_ m: MouseEvent, app: App) {
+    if app.helpShown {
+        if m.press { app.helpShown = false; app.markDirty() }   // a click dismisses the overlay
+        return
+    }
     if m.button & 64 != 0 {                                 // wheel
         moveSelection(app, m.button & 1 == 0 ? -1 : 1)
         app.markDirty()
@@ -754,9 +792,10 @@ func setSort(_ app: App, _ key: SortKey) {
 func draw(_ app: App) {
     let layout = termSize()
     let t = now()
-    let all = app.snapshotDevices()
+    let all = app.snapshotDevices(at: t)
     let visible = app.visible(all)
     let state = app.snapshotState()
+    let authorization = app.radio.authorization
 
     if Ansi.enabled {
         let title = "blescan — \(all.count) BLE devices"
@@ -769,17 +808,17 @@ func draw(_ app: App) {
     }
 
     var lines: [String] = []
+    let rule = Ansi.dim(String(repeating: "─", count: layout.cols))
 
     // Header. (spinnerTick uses &+= and could in theory wrap negative; index via the bit
     // pattern as UInt so the modulo is always in range — Swift's % keeps a negative sign.)
     let spinner = spinnerFrames[Int(UInt(bitPattern: app.spinnerTick) % UInt(spinnerFrames.count))]
     let scanTag = state == .poweredOn ? Ansi.fg256(" \(spinner) scanning…", Pal.scanning) : ""
-    let auth = authLabel(app.radio.authorization)
     let head1 = Ansi.bg256(Ansi.bold(Ansi.fg256("  blescan  ", Pal.badgeFg)), Pal.badgeBg)
         + " " + Ansi.fg256("adapter ", Pal.label)
         + Ansi.fg256(stateLabel(state), state == .poweredOn ? Pal.accent : Pal.warn)
         + Ansi.fg256("  permission ", Pal.label)
-        + Ansi.fg256(auth, auth == "authorized" ? Pal.accent : Pal.warn)
+        + Ansi.fg256(authLabel(authorization), authorization == .allowedAlways ? Pal.accent : Pal.warn)
         + scanTag
     lines.append(clipAnsi(head1, layout.cols))
 
@@ -790,10 +829,10 @@ func draw(_ app: App) {
         + Ansi.fg256("  named-only ", Pal.label) + (app.namedOnly ? "on" : "off")
         + Ansi.fg256("  last ", Pal.label) + timeFormatter.string(from: Date())
     lines.append(clipAnsi(head2, layout.cols))
-    lines.append(Ansi.dim(String(repeating: "─", count: min(layout.cols, 140))))
+    lines.append(rule)
 
     // Permission / power guidance.
-    if state == .unauthorized || auth == "denied" || auth == "restricted" {
+    if state == .unauthorized || authorization == .denied || authorization == .restricted {
         lines.append(clipAnsi(Ansi.fg256("⚠ Bluetooth permission not granted for blescan.", Pal.warn), layout.cols))
         lines.append(clipAnsi(Ansi.dim("  Enable 'blescan' in System Settings → Privacy & Security → Bluetooth, then rerun."), layout.cols))
     } else if state == .poweredOff {
@@ -806,6 +845,10 @@ func draw(_ app: App) {
         lines.append(clipAnsi(Ansi.dim("\(all.count) device\(all.count == 1 ? "" : "s") heard, but none match the current filter / toggles."), layout.cols))
     }
 
+    if layout.cols < tableMinCols {
+        lines.append(clipAnsi(Ansi.fg256("↔ \(layout.cols) columns — the table needs \(tableMinCols); rows are clipped until the window is wider.", Pal.warn), layout.cols))
+    }
+
     // Filter edit / active filter line.
     if app.filterEditing {
         lines.append(clipAnsi(Ansi.fg256("filter: ", Pal.label) + app.filter + Ansi.fg256("▏", Pal.accent)
@@ -814,140 +857,223 @@ func draw(_ app: App) {
         lines.append(clipAnsi(Ansi.fg256("filter: ", Pal.label) + app.filter + Ansi.dim("   (Esc to clear)"), layout.cols))
     }
 
-    // Body layout: detail pane takes a bounded share of the screen, table gets the rest.
     let footer = footerLines(layout.cols)
+
+    if app.helpShown {
+        // The overlay replaces the table AND the detail pane; nothing is clickable.
+        app.headerScreenRow = -1; app.rowScreenStart = -1; app.rowIDs = []; app.sortRegions = []
+        let body = helpLines().map { clipAnsi($0, layout.cols) }
+        let budget = max(1, layout.rows - lines.count - footer.count - 1)
+        lines.append(contentsOf: body.prefix(budget))
+        let used = lines.count + 1 + footer.count
+        if used < layout.rows { lines.append(contentsOf: Array(repeating: "", count: layout.rows - used)) }
+        lines.append(rule)
+        lines.append(contentsOf: footer.map { clipAnsi($0, layout.cols) })
+        paint(app, lines, layout)
+        return
+    }
+
+    // Body layout: detail pane takes a bounded share of the screen, table gets the rest.
     let detail = app.selectedID.flatMap { id in visible.first { $0.id == id } }
         .map { renderDetail($0, cols: layout.cols, now: t) } ?? []
     let detailShown = Array(detail.prefix(min(detail.count, max(6, layout.rows / 3))))
     let chrome = lines.count + footer.count + (detailShown.isEmpty ? 0 : detailShown.count + 1) + 1
     let tableBudget = max(3, layout.rows - chrome)
-
-    let (tableLines, ids) = renderTable(visible, cols: layout.cols, now: t,
-                                        history: app.historyCopy(), selectedID: app.selectedID)
-    let headerRow = tableLines.first
-    let dataRows = Array(tableLines.dropFirst())
     let viewport = max(1, tableBudget - 1)   // minus the header row
 
-    // Scroll so the selected row stays visible.
-    let selIdx = app.selectedID.flatMap { sid in ids.firstIndex(of: sid) } ?? 0
+    // Scroll so the selected row stays visible, then render ONLY the rows in the viewport.
+    let selIdx = visible.firstIndex { $0.id == app.selectedID } ?? 0
     if selIdx < app.scroll { app.scroll = selIdx }
     if selIdx >= app.scroll + viewport { app.scroll = selIdx - viewport + 1 }
-    let maxScroll = max(0, dataRows.count - viewport)
+    let maxScroll = max(0, visible.count - viewport)
     app.scroll = min(max(0, app.scroll), maxScroll)
 
-    if let h = headerRow {
-        app.headerScreenRow = lines.count + 1
-        app.sortRegions = tableSortRegions(layout.cols)
-        lines.append(h)
-        app.rowScreenStart = lines.count + 1
-    }
-    let shownData = Array(dataRows.dropFirst(app.scroll).prefix(viewport))
-    app.rowIDs = Array(ids.dropFirst(app.scroll).prefix(viewport))
-    lines.append(contentsOf: shownData)
+    let window = Array(visible.dropFirst(app.scroll).prefix(viewport))
+    let ids = window.map { $0.id }
+    let tableLines = renderTable(window, cols: layout.cols, now: t,
+                                 history: app.history(for: ids), selectedID: app.selectedID)
+
+    app.headerScreenRow = lines.count + 1
+    app.sortRegions = tableSortRegions(layout.cols)
+    lines.append(tableLines[0])
+    app.rowScreenStart = lines.count + 1
+    app.rowIDs = ids
+    lines.append(contentsOf: tableLines.dropFirst())
 
     // Pad so the bottom chrome sits flush at the bottom.
     let used = lines.count + (detailShown.isEmpty ? 0 : detailShown.count + 1) + 1 + footer.count
     if used < layout.rows { lines.append(contentsOf: Array(repeating: "", count: layout.rows - used)) }
     if !detailShown.isEmpty {
-        lines.append(Ansi.dim(String(repeating: "─", count: min(layout.cols, 140))))
+        lines.append(rule)
         lines.append(contentsOf: detailShown)
     }
-    lines.append(Ansi.dim(String(repeating: "─", count: min(layout.cols, 140))))
+    lines.append(rule)
     lines.append(contentsOf: footer.map { clipAnsi($0, layout.cols) })
+    paint(app, lines, layout)
+}
 
-    // Paint with synchronized output + frame diffing.
+/// Put a frame on screen, rewriting only the rows that differ from the last frame. A full
+/// repaint (clear + every row) happens only when the terminal was resized. Between
+/// adverts, a tick costs the two header rows (spinner, clock) and whichever Age cells
+/// rolled over — a few hundred bytes, not the whole screen. Wrapped in synchronized output
+/// (DEC 2026) so the terminal shows the new rows all at once.
+private func paint(_ app: App, _ lines: [String], _ layout: Layout) {
     let painted = Array(lines.prefix(layout.rows))
-    let sizeChanged = (layout.cols != app.lastCols || layout.rows != app.lastRows)
-    var screen = sizeChanged ? "\u{1B}[2J\u{1B}[H" : "\u{1B}[H"
-    screen += painted.map { $0 + "\u{1B}[K" }.joined(separator: "\r\n")
-    screen += "\u{1B}[J"
-    if screen == app.lastFrame && !sizeChanged { return }
-    app.lastFrame = screen
+    let sizeChanged = layout.cols != app.lastCols || layout.rows != app.lastRows
+    var screen = ""
+    if sizeChanged || painted.count != app.lastLines.count {
+        screen = "\u{1B}[2J\u{1B}[H" + painted.map { $0 + "\u{1B}[K" }.joined(separator: "\r\n")
+    } else {
+        for (i, line) in painted.enumerated() where line != app.lastLines[i] {
+            screen += "\u{1B}[\(i + 1);1H" + line + "\u{1B}[K"
+        }
+        if screen.isEmpty { return }
+    }
+    app.lastLines = painted
     app.lastCols = layout.cols
     app.lastRows = layout.rows
     writeRaw("\u{1B}[?2026h" + screen + "\u{1B}[?2026l")
+}
+
+/// The `?` overlay: every key and mouse action, plus what each column means.
+func helpLines() -> [String] {
+    func k(_ key: String, _ what: String) -> String { "  " + Ansi.fg256(padTo(key, 22), Pal.accent) + what }
+    func c(_ col: String, _ what: String) -> String { "  " + Ansi.fg256(padTo(col, 8), Pal.value) + what }
+    return [
+        Ansi.bold(Ansi.fg256("▎ keys", Pal.beacon)),
+        k("q · Ctrl-C · Ctrl-D", "quit"),
+        k("j / k · ↑ / ↓ · wheel", "move the selection (the detail pane follows it)"),
+        k("p n v t g r", "sort by power (RSSI) · name · vendor · type · age · advert rate — press again to reverse"),
+        k("c", "connectable-only toggle"),
+        k("u", "named-only toggle"),
+        k("/", "filter by name / vendor / type  (Enter applies · Esc clears)"),
+        k("?", "this help  (any key closes it)"),
+        k("mouse", "click a column header to sort · click a row to select it"),
+        "",
+        Ansi.bold(Ansi.fg256("▎ columns", Pal.beacon)),
+        c("Vendor", "from the SIG company id in manufacturer data; 0xXXXX = id not in the curated table; — = no manufacturer data"),
+        c("Type", "best guess from beacon / Continuity / service signatures"),
+        c("dBm", "last RSSI; — when the radio reports it unavailable"),
+        c("Signal", "the same value as a bar over the −100…−40 dBm window"),
+        c("Prox", "immediate / near / far — from the beacon's 1 m reference when it has one, else RSSI thresholds"),
+        c("Conn", "advertises as connectable: yes / no / ? (not stated)"),
+        c("Age", "since the last packet; rows dim after 10 s and drop after 60 s"),
+        c("Adv/s", "packets per second over the last 5 s — beacons and trackers are steady, phones burst"),
+        c("Trend", "RSSI sparkline, one sample per second (wide terminals only)"),
+    ]
 }
 
 /// The one-line key hint, sized to the terminal width: the richest variant that fits
 /// `cols` wins, shedding the verbose mouse help, then the brief one, then per-key detail
 /// as the window narrows — so it never gets truncated mid-word the way one fixed string
 /// does. The last (most compact) variant is the floor; on a terminal too narrow for even
-/// that the draw-time clipAnsi trims it, but the table has already overrun its ~87-col
-/// floor by then. Tier widths: 173 / 125 / 100 / 87 / 61 columns.
+/// that the draw-time clipAnsi trims it, but the table has already overrun its
+/// `tableMinCols` floor by then. Tier widths: 189 / 141 / 116 / 103 / 71 columns.
 func footerLines(_ cols: Int) -> [String] {
     let variants = [
-        "[q]uit  [j/k]select  [p]ower [n]ame [v]endor [t]ype a[g]e sort  [c]onn-only [u]named-only  [/]filter  ·  mouse: wheel selects, click a header to sort, click a row to inspect",
-        "[q]uit  [j/k]select  [p]ower [n]ame [v]endor [t]ype a[g]e sort  [c]onn-only [u]named-only  [/]filter  ·  mouse: wheel + click",
-        "[q]uit  [j/k]select  [p]ower [n]ame [v]endor [t]ype a[g]e sort  [c]onn-only [u]named-only  [/]filter",
-        "[q]uit  [j/k]sel  [p]ower [n]ame [v]endor [t]ype a[g]e sort  [c]onn [u]named  [/]filter",
-        "[q]uit  [j/k]sel  [p/n/v/t/g]sort  [c]onn [u]named  [/]filter",
+        "[q]uit  [j/k]select  [p]ower [n]ame [v]endor [t]ype a[g]e [r]ate sort  [c]onn-only [u]named-only  [/]filter  [?]help  ·  mouse: wheel selects, click a header to sort, click a row to inspect",
+        "[q]uit  [j/k]select  [p]ower [n]ame [v]endor [t]ype a[g]e [r]ate sort  [c]onn-only [u]named-only  [/]filter  [?]help  ·  mouse: wheel + click",
+        "[q]uit  [j/k]select  [p]ower [n]ame [v]endor [t]ype a[g]e [r]ate sort  [c]onn-only [u]named-only  [/]filter  [?]help",
+        "[q]uit  [j/k]sel  [p]ower [n]ame [v]endor [t]ype a[g]e [r]ate sort  [c]onn [u]named  [/]filter  [?]help",
+        "[q]uit  [j/k]sel  [p/n/v/t/g/r]sort  [c]onn [u]named  [/]filter  [?]help",
     ]
     return [Ansi.dim(widthFittingVariant(variants, cols))]
 }
 
-// MARK: - Non-interactive collection (--once / --json / --diag)
+// MARK: - Non-interactive collection (--once / --json / --stream / --diag)
 
 /// Start the radio and block `window` seconds while the BLE queue accumulates devices,
-/// then return the snapshot. A short initial grace lets the adapter reach poweredOn.
+/// then return the snapshot. The window also covers the adapter's ramp to poweredOn.
 private func collect(app: App, window: TimeInterval) -> [Device] {
     app.wireRadio()
     app.radio.start()
-    let deadline = Date().addingTimeInterval(window)
-    while Date() < deadline {
-        app.prune(at: now(), drop: 120)
-        Thread.sleep(forTimeInterval: 0.1)
-    }
+    Thread.sleep(forTimeInterval: window)
     app.radio.stop()
-    return app.snapshotDevices()
+    return app.snapshotDevices(at: now())
+}
+
+/// One device as JSON (`--json` array element / `--stream` line). Optional fields are
+/// omitted when absent (synthesized Encodable uses encodeIfPresent), so the output only
+/// carries what a device actually advertised. Services are raw normalised UUIDs so a
+/// consumer can match on them (`select(.services | index("180D"))`); the display strings
+/// live beside them in `serviceNames`.
+struct DeviceJSON: Encodable {
+    struct Beacon: Encodable { let uuid: String; let major: Int; let minor: Int; let measuredPower: Int }
+    struct ServiceData: Encodable { let service: String; let serviceName: String; let hex: String }
+
+    let ts: String?                  // --stream only: wall-clock time of the line
+    let id: String
+    let name: String?
+    let rssi: Int?
+    let txPower: Int?
+    let connectable: Bool?
+    let vendor: String
+    let companyId: String?
+    let type: String
+    let proximity: String
+    let advertsPerSecond: Double
+    let firstSeenSecondsAgo: Int
+    let lastSeenSecondsAgo: Int
+    let services: [String]
+    let serviceNames: [String]
+    let solicitedServices: [String]?
+    let overflowServices: [String]?
+    let continuity: [String]?
+    let iBeacon: Beacon?
+    let eddystone: String?
+    let manufacturerHex: String?
+    let serviceData: [ServiceData]?
+
+    init(_ d: Device, now t: Double, ts: String? = nil) {
+        func nilIfEmpty<T>(_ a: [T]) -> [T]? { a.isEmpty ? nil : a }
+        self.ts = ts
+        id = d.id
+        name = d.name
+        rssi = d.hasValidRSSI ? d.rssi : nil          // 127 == unavailable → omit
+        txPower = d.txPower
+        connectable = d.connectable
+        vendor = d.vendor
+        companyId = d.companyId.map { String(format: "0x%04X", $0) }
+        type = d.typeLabel
+        proximity = d.proximityBucket.label
+        advertsPerSecond = (d.advertsPerSecond * 10).rounded() / 10
+        firstSeenSecondsAgo = Int(d.seenFor(now: t).rounded())
+        lastSeenSecondsAgo = Int(d.age(now: t).rounded())
+        services = d.advertisedServices
+        serviceNames = d.advertisedServices.map(friendlyService)
+        solicitedServices = nilIfEmpty(d.solicitedUUIDs)
+        overflowServices = nilIfEmpty(d.overflowUUIDs)
+        continuity = nilIfEmpty(d.continuityTypes.compactMap(continuityName))
+        iBeacon = d.iBeacon.map { Beacon(uuid: $0.uuid, major: Int($0.major), minor: Int($0.minor), measuredPower: $0.measuredPower) }
+        eddystone = d.eddystone?.summary
+        manufacturerHex = d.manufacturerData.isEmpty ? nil : hexString(d.manufacturerData)
+        serviceData = nilIfEmpty(d.serviceData.filter { !$0.bytes.isEmpty }
+            .map { ServiceData(service: $0.uuid, serviceName: friendlyService($0.uuid), hex: hexString($0.bytes)) })
+    }
+}
+
+private func writeStderr(_ line: String) { FileHandle.standardError.write(Data((line + "\n").utf8)) }
+
+/// `--json` exits 3 (with a line on stderr) if the radio never came up, so a caller can
+/// tell an empty room from a scan that never happened. (--once prints its own hint line
+/// and --diag reports the state, so the JSON modes were the only ones with no signal.)
+private func failIfNeverScanned(_ app: App) {
+    if let problem = headlessScanFailure(poweredOn: app.snapshotState() == .poweredOn,
+                                         state: stateLabel(app.snapshotState()),
+                                         authorization: authLabel(app.radio.authorization)) {
+        writeStderr(problem)
+        exit(3)
+    }
 }
 
 func runOnce(app: App, window: TimeInterval, json: Bool) {
     let devices = sortDevices(collect(app: app, window: window), by: app.sortKey, ascending: app.ascending)
+    let t = now()   // after the scan, so the ages are measured from the moment of output
     if json {
-        // Optional fields are omitted when absent (synthesized Encodable uses
-        // encodeIfPresent), so the JSON only carries what a device actually advertised.
-        struct BeaconOut: Encodable { let uuid: String; let major: Int; let minor: Int; let measuredPower: Int }
-        struct SvcDataOut: Encodable { let service: String; let hex: String }
-        struct Out: Encodable {
-            let id: String; let name: String?; let rssi: Int?; let txPower: Int?
-            let connectable: Bool?; let vendor: String; let companyId: String?
-            let type: String; let proximity: String; let services: [String]
-            let solicitedServices: [String]?; let overflowServices: [String]?
-            let continuity: [String]?; let iBeacon: BeaconOut?; let eddystone: String?
-            let manufacturerHex: String?; let serviceData: [SvcDataOut]?
-        }
-        func nilIfEmpty<T>(_ a: [T]) -> [T]? { a.isEmpty ? nil : a }
-        let arr = devices.map { d -> Out in
-            Out(id: d.id,
-                name: d.name,
-                rssi: d.hasValidRSSI ? d.rssi : nil,          // 127 == unavailable → omit
-                txPower: d.txPower,
-                connectable: d.connectable,
-                vendor: d.vendor,
-                companyId: d.companyId.map { String(format: "0x%04X", $0) },
-                type: d.typeLabel,
-                proximity: d.proximityBucket.label,
-                services: (d.serviceUUIDs + d.serviceData.map { $0.uuid }).map(friendlyService),
-                solicitedServices: nilIfEmpty(d.solicitedUUIDs.map(friendlyService)),
-                overflowServices: nilIfEmpty(d.overflowUUIDs.map(friendlyService)),
-                continuity: nilIfEmpty(d.continuityTypes.compactMap(continuityName)),
-                iBeacon: d.iBeacon.map { BeaconOut(uuid: $0.uuid, major: Int($0.major), minor: Int($0.minor), measuredPower: $0.measuredPower) },
-                eddystone: d.eddystone?.summary,
-                manufacturerHex: d.manufacturerData.isEmpty ? nil : hexString(d.manufacturerData),
-                serviceData: nilIfEmpty(d.serviceData.filter { !$0.bytes.isEmpty }.map { SvcDataOut(service: friendlyService($0.uuid), hex: hexString($0.bytes)) }))
-        }
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let arr = devices.map { DeviceJSON($0, now: t) }
         if let data = try? enc.encode(arr), let s = String(data: data, encoding: .utf8) { print(s) } else { print("[]") }
-        // The array is on stdout either way; if the radio never came up, say so on stderr
-        // and exit 3 so a caller can tell an empty room from a scan that never happened.
-        // (--once prints its own hint line and --diag reports the state, so JSON was the
-        // only mode with no signal at all.)
-        if let problem = headlessScanFailure(poweredOn: app.snapshotState() == .poweredOn,
-                                             state: stateLabel(app.snapshotState()),
-                                             authorization: authLabel(app.radio.authorization)) {
-            FileHandle.standardError.write(Data((problem + "\n").utf8))
-            exit(3)
-        }
+        failIfNeverScanned(app)
         return
     }
     print(Ansi.bold("blescan — \(devices.count) BLE devices  (adapter \(stateLabel(app.snapshotState())), permission \(authLabel(app.radio.authorization)))"))
@@ -956,25 +1082,62 @@ func runOnce(app: App, window: TimeInterval, json: Bool) {
         return
     }
     print("")
-    let t = now()
-    let (lines, _) = renderTable(devices, cols: termSize().cols, now: t, history: [:], selectedID: nil)
-    for line in lines { print(line) }
+    for line in renderTable(devices, cols: termSize().cols, now: t, history: [:], selectedID: nil) { print(line) }
 }
 
-func runDiag(app: App) {
-    let devices = collect(app: app, window: 3.0)
+/// `--stream`: NDJSON on stdout for as long as the process runs (or `window` seconds). One
+/// line per device per packet, throttled to at most one line per device per second so a
+/// chatty beacon (allow-duplicates delivers every packet, tens a second) can't flood the
+/// pipe; a silent device produces nothing. Each line is the `--json` object plus `ts`.
+func runStream(app: App, window: TimeInterval?) {
+    setvbuf(stdout, nil, _IOLBF, 0)   // a pipe is block-buffered by default: flush per line
+    app.wireRadio()
+    app.radio.start()
+    let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
+    let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let start = now()
+    var writtenAt: [String: Double] = [:]        // id → when we last wrote it
+    var writtenSeen: [String: Double] = [:]      // id → the lastSeen that line carried
+    while true {
+        let t = now()
+        if let w = window, t - start >= w { break }
+        let state = app.snapshotState()
+        if state == .poweredOff || state == .unauthorized || state == .unsupported { failIfNeverScanned(app) }
+        app.prune(at: t, drop: 60)
+        let live = app.snapshotDevices(at: t)
+        for d in live where d.lastSeen > (writtenSeen[d.id] ?? -1) && t - (writtenAt[d.id] ?? -1) >= 1 {
+            let row = DeviceJSON(d, now: t, ts: iso.string(from: Date()))
+            if let data = try? enc.encode(row), let s = String(data: data, encoding: .utf8) { print(s) }
+            writtenAt[d.id] = t; writtenSeen[d.id] = d.lastSeen
+        }
+        // Forget bookkeeping for pruned devices; a long stream sees endless rotating ids.
+        if writtenAt.count > live.count * 2 + 16 {
+            let ids = Set(live.map { $0.id })
+            writtenAt = writtenAt.filter { ids.contains($0.key) }
+            writtenSeen = writtenSeen.filter { ids.contains($0.key) }
+        }
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+    app.radio.stop()
+    failIfNeverScanned(app)
+}
+
+func runDiag(app: App, window: TimeInterval) {
+    let devices = collect(app: app, window: window)
     let named = devices.filter { $0.isNamed }.count
+    let state = app.snapshotState(), auth = app.radio.authorization
     print("blescan diagnostics")
-    print("  adapter state      : \(stateLabel(app.snapshotState()))")
-    print("  permission         : \(authLabel(app.radio.authorization))")
+    print("  version            : \(blescanVersion)")
+    print("  adapter state      : \(stateLabel(state))")
+    print("  permission         : \(authLabel(auth))")
     print("  devices found      : \(devices.count)")
     print("  named devices      : \(named)/\(devices.count)")
     print("  truecolor terminal : \(Term.truecolor)")
-    if app.snapshotState() == .unauthorized || authLabel(app.radio.authorization) == "denied" {
+    if state == .unauthorized || auth == .denied || auth == .restricted {
         print("")
         print("  ⚠ Bluetooth permission isn't granted for blescan.")
         print("    System Settings → Privacy & Security → Bluetooth → enable 'blescan'.")
-    } else if app.snapshotState() == .poweredOff {
+    } else if state == .poweredOff {
         print("")
         print("  ⚠ Bluetooth is powered off — turn it on to scan.")
     }
@@ -982,55 +1145,72 @@ func runDiag(app: App) {
 
 // MARK: - Entry
 
+/// CFBundleShortVersionString from the Info.plist the Makefile embeds into the Mach-O
+/// (`-sectcreate __TEXT __info_plist`); a plain `swift build` has no plist, hence "dev".
+let blescanVersion: String = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+
 func printHelp() {
     print("""
     blescan — live Bluetooth Low Energy scanner & fingerprinter (macOS, CoreBluetooth)
 
     USAGE:
       blescan            interactive TUI (default)
-      blescan --once     scan ~6s, print the device table, then exit
-      blescan --json     scan ~6s, emit the devices as JSON on stdout
+      blescan --once     scan, print the device table, then exit
+      blescan --json     scan, emit the devices as a JSON array on stdout
+      blescan --stream   emit NDJSON — one line per device per packet (≤ 1 line/device/s)
+                         — until killed, or for --window seconds
       blescan --diag     print adapter / permission diagnostics
+      blescan --version  print the version  (also -V)
       blescan --help     show this help  (also -h)
 
-    --json exits 3 (with a line on stderr) when the adapter never powered on, so an
-    empty array from a quiet room is distinguishable from a scan that never happened.
+    OPTIONS:
+      --window N         seconds to scan in the headless modes (default 6; 3 for --diag;
+                         unbounded for --stream). Also --window=N.
+
+    --json and --stream exit 3 (with a line on stderr) when the adapter never powered on,
+    so an empty result from a quiet room is distinguishable from a scan that never happened.
 
     Colour is automatic: on in a terminal, off when piped/redirected (or set NO_COLOR).
 
     TUI KEYS:
-      q / Ctrl-C / Ctrl-D quit · j/k (or ↑/↓) select · p/n/v/t/g sort (again to reverse)
-      c connectable-only · u named-only · / filter (Enter apply, Esc clear)
+      q / Ctrl-C / Ctrl-D quit · j/k (or ↑/↓) select · p/n/v/t/g/r sort (again to reverse)
+      c connectable-only · u named-only · / filter (Enter apply, Esc clear) · ? help
       mouse: wheel selects · click a header to sort · click a row to inspect
     """)
 }
 
 func main() {
-    let args = CommandLine.arguments
-    if args.contains("--help") || args.contains("-h") { printHelp(); return }
-
-    let known: Set<String> = ["--once", "--json", "--diag"]
-    for a in args.dropFirst() where !known.contains(a) {
-        FileHandle.standardError.write(Data("error: unknown option '\(a)' (see --help)\n".utf8))
-        exit(2)
+    let opts: Options
+    switch parseArguments(Array(CommandLine.arguments.dropFirst())) {
+    case .success(let o): opts = o
+    case .failure(let e): writeStderr(e.message); exit(2)
     }
 
     Ansi.enabled = ProcessInfo.processInfo.environment["NO_COLOR"] == nil && isatty(STDOUT_FILENO) != 0
 
     let app = App()
-    if args.contains("--diag") { runDiag(app: app); return }
-    if args.contains("--json") { runOnce(app: app, window: 6.0, json: true); return }
-    if args.contains("--once") { runOnce(app: app, window: 6.0, json: false); return }
-
-    // The interactive TUI needs a real terminal to draw to AND to read keys from. If
-    // either end is piped/redirected there's nowhere to render or no blocking key read
-    // (a non-tty stdin returns EOF immediately and would spin the loop at 100% CPU) —
-    // point the user at the headless modes instead.
-    if isatty(STDOUT_FILENO) == 0 || isatty(STDIN_FILENO) == 0 {
-        FileHandle.standardError.write(Data("blescan: the interactive TUI needs a terminal on stdin and stdout — use --once or --json when piping.\n".utf8))
-        exit(1)
+    switch opts.mode {
+    case .help:    printHelp()
+    case .version: print("blescan \(blescanVersion)")
+    case .diag:    runDiag(app: app, window: opts.window ?? 3.0)
+    case .json:    runOnce(app: app, window: opts.window ?? 6.0, json: true)
+    case .once:    runOnce(app: app, window: opts.window ?? 6.0, json: false)
+    case .stream:  runStream(app: app, window: opts.window)
+    case .tui:
+        // The interactive TUI needs a real terminal to draw to AND to read keys from. If
+        // either end is piped/redirected there's nowhere to render or no blocking key read
+        // (a non-tty stdin returns EOF immediately and would spin the loop at 100% CPU) —
+        // point the user at the headless modes instead.
+        if isatty(STDOUT_FILENO) == 0 || isatty(STDIN_FILENO) == 0 {
+            writeStderr("blescan: the interactive TUI needs a terminal on stdin and stdout — use --once, --json or --stream when piping.")
+            exit(1)
+        }
+        if opts.window != nil {
+            writeStderr("blescan: --window only applies to the headless modes (--once, --json, --stream, --diag).")
+            exit(2)
+        }
+        runInteractive(app: app)
     }
-    runInteractive(app: app)
 }
 
 main()

@@ -25,10 +25,11 @@ func eq<T: Equatable>(_ a: T, _ b: T, _ msg: String) {
 func dev(id: String = "id", name: String? = "x", rssi: Int = -60, tx: Int? = nil,
          conn: Bool? = nil, mfg: [UInt8] = [], svc: [String] = [],
          svcData: [ServiceDatum] = [], solicited: [String] = [], overflow: [String] = [],
-         first: Double = 0, last: Double = 0) -> Device {
+         first: Double = 0, last: Double = 0, rate: Double = 0) -> Device {
     Device(id: id, name: name, rssi: rssi, txPower: tx, connectable: conn,
            manufacturerData: mfg, serviceUUIDs: svc, serviceData: svcData,
-           solicitedUUIDs: solicited, overflowUUIDs: overflow, firstSeen: first, lastSeen: last)
+           solicitedUUIDs: solicited, overflowUUIDs: overflow,
+           firstSeen: first, lastSeen: last, advertsPerSecond: rate)
 }
 
 /// Names of a sorted result, joined, for compact ordering assertions.
@@ -61,6 +62,9 @@ let ibeaconBytes: [UInt8] =
         testSanitize()
         testHeadlessOutcome()
         testDevice()
+        testAbsorb()
+        testAdvertRate()
+        testArguments()
 
         print("\(checks - failures)/\(checks) checks passed")
         exit(failures == 0 ? 0 : 1)
@@ -72,8 +76,6 @@ let ibeaconBytes: [UInt8] =
         eq(companyIdentifier([0x4C, 0x00]), 0x004C, "company id little-endian")
         eq(companyIdentifier([0x75, 0x00, 0xFF]), 0x0075, "company id ignores payload")
         ok(companyIdentifier([0x4C]) == nil, "company id nil when < 2 bytes")
-        eq(manufacturerPayload([0x4C, 0x00, 0xAA, 0xBB]), [0xAA, 0xBB], "payload after company id")
-        eq(manufacturerPayload([0x4C, 0x00]), [], "no payload when only company id")
     }
 
     // MARK: Vendor labels
@@ -82,6 +84,9 @@ let ibeaconBytes: [UInt8] =
         eq(companyName(0x004C), "Apple", "Apple company name")
         eq(companyName(0x0075), "Samsung Electronics", "Samsung company name")
         eq(companyName(0x00E0), "Google", "Google company name")
+        eq(companyName(0x0065), "HP", "HP company name")
+        eq(companyName(0x07D0), "Tuya", "Tuya company name")
+        eq(companyName(0x067C), "Tile", "Tile company name")
         ok(companyName(0xFFFE) == nil, "unknown company id → nil")
         eq(vendorLabel(0x004C), "Apple", "vendorLabel known → name")
         eq(vendorLabel(0xABCD), "0xABCD", "vendorLabel unknown → hex")
@@ -280,6 +285,10 @@ let ibeaconBytes: [UInt8] =
                  dev(id: "c", rssi: -30, last: 30)]
         eq(order(sortDevices(g, by: .age, ascending: false)), "cba", "age newest first, tie by rssi")
 
+        // rate: busiest first; equal rate ties by rssi.
+        let ra = [dev(id: "a", rssi: -50, rate: 1), dev(id: "b", rssi: -40, rate: 8), dev(id: "c", rssi: -30, rate: 1)]
+        eq(order(sortDevices(ra, by: .rate, ascending: false)), "bca", "rate busiest first, tie by rssi")
+
         // Drive deviceBefore in both directions so each ternary's true/false sides run.
         ok(deviceBefore(dev(id: "a", rssi: -40), dev(id: "b", rssi: -70), by: .rssi), "stronger sorts first")
         ok(deviceBefore(dev(id: "a", rssi: -40), dev(id: "b", rssi: -40), by: .rssi), "equal rssi → id order")
@@ -292,6 +301,7 @@ let ibeaconBytes: [UInt8] =
         ok(deviceBefore(dev(rssi: -40, svc: ["180D"]), dev(rssi: -70, svc: ["180D"]), by: .type),
            "equal type → stronger rssi")
         ok(deviceBefore(dev(rssi: -40, last: 5), dev(rssi: -70, last: 5), by: .age), "equal age → stronger rssi")
+        ok(deviceBefore(dev(rssi: -40, rate: 2), dev(rssi: -70, rate: 2), by: .rate), "equal rate → stronger rssi")
 
         // Totality. Devices that tie on the key AND on RSSI must still compare — every
         // branch but .rssi used to stop at the RSSI tiebreaker and report `false` in both
@@ -299,7 +309,7 @@ let ibeaconBytes: [UInt8] =
         // On screen the tied rows then swap places whenever the device dictionary rehashes.
         let tied = [dev(id: "a", name: nil, rssi: -70), dev(id: "b", name: nil, rssi: -70),
                     dev(id: "c", name: nil, rssi: -70)]
-        for key in [SortKey.name, .vendor, .type, .age] {
+        for key in [SortKey.name, .vendor, .type, .age, .rate] {
             eq(order(sortDevices(tied, by: key, ascending: false)),
                order(sortDevices(Array(tied.reversed()), by: key, ascending: false)),
                "\(key.label): fully tied devices sort the same whatever order they arrive in")
@@ -312,6 +322,7 @@ let ibeaconBytes: [UInt8] =
         eq(SortKey.vendor.label, "Vendor", "label vendor")
         eq(SortKey.type.label, "Type", "label type")
         eq(SortKey.age.label, "Age", "label age")
+        eq(SortKey.rate.label, "Rate", "label rate")
     }
 
     // MARK: UUID helpers
@@ -323,11 +334,9 @@ let ibeaconBytes: [UInt8] =
            "1234ABCD-0000-1000-8000-00805F9B34FB", "32-bit-on-base keeps full form")
         eq(normalizeUUID(nordicUARTService), nordicUARTService, "non-base 128-bit unchanged")
 
-        eq(serviceName("180D"), "Heart Rate", "serviceName known")
-        ok(serviceName("1234") == nil, "serviceName unknown → nil")
-
         eq(friendlyService("180d"), "Heart Rate (0x180D)", "friendlyService known 16-bit")
         eq(friendlyService(nordicUARTService), "Nordic UART (NUS) (\(nordicUARTService))", "friendlyService known long")
+        eq(friendlyService("FE9F"), "Google (0xFE9F)", "friendlyService member service")
         eq(friendlyService("1234"), "0x1234", "friendlyService unknown 16-bit")
         eq(friendlyService("12345678-1234-1234-1234-123456789ABC"),
            "12345678-1234-1234-1234-123456789ABC", "friendlyService unknown long")
@@ -564,6 +573,13 @@ let ibeaconBytes: [UInt8] =
         eq(plain.proximityBucket, .immediate, "plain device proximity from RSSI")
         ok(plain.serviceShortSet.contains("180F") && plain.serviceShortSet.contains("1812"),
            "serviceShortSet merges all UUID sources")
+        eq(plain.advertisedServices, ["180F"], "advertisedServices excludes solicited / overflow")
+
+        // An Eddystone advert lists FEAA as a service AND carries FEAA service data: the
+        // listing must name it once, service list first, and keep the original order.
+        let twice = dev(svc: ["FEAA", "180F"], svcData: [urlSvc, ServiceDatum(uuid: "0000180A-0000-1000-8000-00805F9B34FB", bytes: [])])
+        eq(twice.advertisedServices, ["FEAA", "180F", "0000180A-0000-1000-8000-00805F9B34FB"],
+           "advertisedServices dedupes across service list + service data, order kept")
         eq(plain.continuityTypes, [], "non-Apple device has no continuity segments")
 
         // Names + validity flags.
@@ -576,5 +592,108 @@ let ibeaconBytes: [UInt8] =
         ok(!dev(rssi: 127).hasValidRSSI, "sentinel rssi invalid")
         eq(dev(last: 100).age(now: 105), 5, "age = now − lastSeen")
         eq(dev(last: 100).age(now: 90), 0, "age clamps at 0 for clock skew")
+        eq(dev(first: 40, last: 100).seenFor(now: 100), 60, "seenFor = now − firstSeen")
+        eq(dev(first: 100).seenFor(now: 90), 0, "seenFor clamps at 0 for clock skew")
+    }
+
+    // MARK: Merging adverts (Device.absorb) + fingerprint caching
+
+    static func testAbsorb() {
+        var d = dev(name: "Old", rssi: -70, tx: 4, conn: false, mfg: [0x59, 0x00], svc: ["180F"],
+                    svcData: [ServiceDatum(uuid: "180F", bytes: [0x64])], solicited: ["1811"], overflow: ["1812"],
+                    first: 1, last: 1)
+        eq(d.vendor, "Nordic Semiconductor", "fingerprint derived at init")
+
+        // A scan response carrying only an RSSI: every optional / empty field is KEPT from
+        // the previous packet, not wiped; lastSeen advances; the fingerprint is untouched.
+        let before = d.fingerprint
+        d.absorb(dev(name: nil, rssi: -55, tx: nil, conn: nil), at: 7)
+        eq(d.name, "Old", "empty advert keeps the name")
+        eq(d.rssi, -55, "rssi always taken from the newest packet")
+        eq(d.txPower, 4, "absent tx power keeps the old value")
+        eq(d.connectable, false, "absent connectable keeps the old value")
+        eq(d.manufacturerData, [0x59, 0x00], "empty manufacturer data keeps the old bytes")
+        eq(d.serviceUUIDs, ["180F"], "empty service list keeps the old list")
+        eq(d.serviceData.count, 1, "empty service data keeps the old entries")
+        eq(d.solicitedUUIDs, ["1811"], "empty solicited list kept")
+        eq(d.overflowUUIDs, ["1812"], "empty overflow list kept")
+        eq(d.lastSeen, 7, "lastSeen stamped")
+        eq(d.firstSeen, 1, "firstSeen never moves")
+        eq(d.fingerprint.vendor, before.vendor, "unchanged raw fields → fingerprint not rebuilt")
+
+        // The same packet again: fields equal, nothing changes, fingerprint still stable.
+        d.absorb(dev(name: "Old", rssi: -56, tx: 4, conn: false, mfg: [0x59, 0x00], svc: ["180F"],
+                     svcData: [ServiceDatum(uuid: "180F", bytes: [0x64])], solicited: ["1811"], overflow: ["1812"]), at: 8)
+        eq(d.rssi, -56, "rssi updated on an identical advert")
+        eq(d.vendor, "Nordic Semiconductor", "identical advert leaves the fingerprint alone")
+
+        // A packet that changes every field: all taken, fingerprint re-derived (vendor +
+        // type follow the new manufacturer data / services).
+        d.absorb(dev(name: "New", rssi: -40, tx: 0, conn: true, mfg: ibeaconBytes, svc: ["180D"],
+                     svcData: [ServiceDatum(uuid: "FEAA", bytes: [0x10, 0xEC, 0x02, 0x67])],
+                     solicited: ["1802"], overflow: ["1803"]), at: 9)
+        eq(d.name, "New", "new name taken")
+        eq(d.txPower, 0, "new tx power taken (even 0)")
+        eq(d.connectable, true, "new connectable taken")
+        eq(d.vendor, "Apple", "fingerprint re-derived: vendor follows manufacturer data")
+        eq(d.typeLabel, "iBeacon", "fingerprint re-derived: type follows the beacon payload")
+        eq(d.serviceUUIDs, ["180D"], "new service list taken")
+        eq(d.serviceData.first?.uuid, "FEAA", "new service data taken")
+        eq(d.solicitedUUIDs, ["1802"], "new solicited list taken")
+        eq(d.overflowUUIDs, ["1803"], "new overflow list taken")
+        ok(d.eddystone != nil, "fingerprint re-derived: Eddystone parsed from the new service data")
+        eq(d.calibratedRSSIAt1m, -59, "iBeacon reference wins over the Eddystone one")
+    }
+
+    // MARK: Advertisement rate
+
+    static func testAdvertRate() {
+        var r = AdvertRate()
+        eq(r.perSecond(at: 10), 0, "never heard → 0")
+        r.record(at: 10)
+        eq(r.perSecond(at: 10), 1, "one packet, just now → 1/s (1 s floor, not ∞)")
+        r.record(at: 10.5); r.record(at: 11)
+        eq(r.perSecond(at: 12), 1.5, "3 packets over 2 s since first heard → 1.5/s")
+        // Past a full window the divisor is the window, and old stamps fall out of it.
+        for t in stride(from: 12.0, through: 20.0, by: 0.5) { r.record(at: t) }   // 17 more
+        eq(r.perSecond(at: 20), 2.0, "only the last 5 s count: 10 packets in (15, 20] → 2.0/s")
+        eq(r.perSecond(at: 26), 0, "silent for a window → 0")
+        r.record(at: 30)
+        eq(r.perSecond(at: 30), 0.2, "one packet after a long gap: window divisor, not the 1 s floor")
+
+        eq(formatRate(0), "—", "silent → dash")
+        eq(formatRate(0.26), "0.3", "sub-10 → one decimal")
+        eq(formatRate(9.96), "10", "rounds up into the whole-number form")
+        eq(formatRate(24.4), "24", "≥10 → whole number")
+    }
+
+    // MARK: Command line
+
+    static func testArguments() {
+        eq(parseArguments([]), .success(Options(mode: .tui)), "no flags → TUI")
+        eq(parseArguments(["--once"]), .success(Options(mode: .once)), "--once")
+        eq(parseArguments(["--json"]), .success(Options(mode: .json)), "--json")
+        eq(parseArguments(["--stream"]), .success(Options(mode: .stream)), "--stream")
+        eq(parseArguments(["--diag"]), .success(Options(mode: .diag)), "--diag")
+        eq(parseArguments(["--json", "--json"]), .success(Options(mode: .json)), "repeating a mode is harmless")
+        eq(parseArguments(["--help"]), .success(Options(mode: .help)), "--help")
+        eq(parseArguments(["-h"]), .success(Options(mode: .help)), "-h")
+        eq(parseArguments(["--json", "--help"]), .success(Options(mode: .help)), "--help wins over a mode")
+        eq(parseArguments(["--version"]), .success(Options(mode: .version)), "--version")
+        eq(parseArguments(["-V"]), .success(Options(mode: .version)), "-V")
+        eq(parseArguments(["--json", "--window", "10"]), .success(Options(mode: .json, window: 10)), "--window N")
+        eq(parseArguments(["--window=2.5", "--once"]), .success(Options(mode: .once, window: 2.5)), "--window=N, any order")
+        eq(parseArguments(["--once", "--json"]),
+           .failure(UsageError(message: "error: --once and --json are mutually exclusive (see --help)")), "two modes")
+        eq(parseArguments(["--window"]),
+           .failure(UsageError(message: "error: --window needs a number of seconds (see --help)")), "--window without a value")
+        eq(parseArguments(["--window", "soon"]),
+           .failure(UsageError(message: "error: --window must be a positive number of seconds, got 'soon'")), "--window non-numeric")
+        eq(parseArguments(["--window=0"]),
+           .failure(UsageError(message: "error: --window must be a positive number of seconds, got '0'")), "--window zero")
+        eq(parseArguments(["--window=inf"]),
+           .failure(UsageError(message: "error: --window must be a positive number of seconds, got 'inf'")), "--window infinite")
+        eq(parseArguments(["--bogus"]),
+           .failure(UsageError(message: "error: unknown option '--bogus' (see --help)")), "unknown flag")
     }
 }

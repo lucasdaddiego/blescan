@@ -25,8 +25,15 @@ jobs:
 
       # Compiles the whole app — Core.swift plus main.swift and its CoreBluetooth
       # links — so a break in the framework-facing code fails CI too.
-      - name: Build
+      - name: Build (SwiftPM, debug)
         run: swift build
+
+      # The shipped binary is NOT the SwiftPM one: `make build` is the release path —
+      # -O, symbol strip, -dead_strip, the Info.plist embedded via -sectcreate, then an
+      # ad-hoc codesign. Until this ran here, a linker-flag or plist regression only
+      # surfaced on a developer's `make install`.
+      - name: Build (release, Makefile)
+        run: make build
 
       # Fast, uninstrumented run of the dependency-free core unit tests.
       - name: Unit tests

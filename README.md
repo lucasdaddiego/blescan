@@ -90,17 +90,20 @@ packages, no root.
 - **Resolved services** — well‑known SIG service UUIDs shown by friendly name
   (`Heart Rate (0x180D)`), not raw hex.
 - **Live signal** — colour‑coded RSSI and signal bar, a **per‑device sparkline** of the
-  recent trend, and an **RSSI → proximity** estimate (immediate / near / far) using the
-  advertised calibration when present.
-- **Sortable / filterable** — sort by RSSI, name, vendor, type or age (reverse with the
-  same key); live substring **filter**; **connectable‑only** and **named‑only** toggles.
+  recent trend, an **advertisement rate** column (packets/s — beacons and trackers are
+  steady, phones burst), and an **RSSI → proximity** estimate (immediate / near / far)
+  using the advertised calibration when present.
+- **Sortable / filterable** — sort by RSSI, name, vendor, type, age or rate (reverse with
+  the same key); live substring **filter**; **connectable‑only** and **named‑only** toggles;
+  `?` for an in‑app key / column reference.
 - **Detail pane** — full per‑device breakdown including a **hex dump of the raw
   advertisement bytes** (manufacturer + each service‑data entry).
-- **Modern‑terminal niceties** — flicker‑free **synchronized** frames, **mouse**
-  (wheel selects, click a header to sort, click a row to inspect), a **24‑bit colour**
-  gradient on truecolor terminals (256‑palette fallback), and a live window/tab title.
-  All auto‑gated, so dumb terminals and pipes still work.
-- **Scriptable** — `--once`, `--json` (pipe into `jq`) and `--diag` modes.
+- **Modern‑terminal niceties** — flicker‑free **synchronized** frames that repaint only
+  the rows that changed, **mouse** (wheel selects, click a header to sort, click a row to
+  inspect), a **24‑bit colour** gradient on truecolor terminals (256‑palette fallback),
+  and a live window/tab title. All auto‑gated, so dumb terminals and pipes still work.
+- **Scriptable** — `--once`, `--json` (pipe into `jq`), `--stream` (NDJSON, for
+  continuous capture) and `--diag` modes, with `--window N` to set the scan length.
 - **Single self‑contained binary**, code‑signed with the Info.plist embedded in the
   Mach‑O; **zero dependencies**, no root.
 
@@ -172,17 +175,24 @@ self‑signed certificate:
 
 ```sh
 blescan                  # interactive TUI (default)
-blescan --once           # scan ~6s, print the device table, then exit
-blescan --json           # scan ~6s, emit the devices as JSON on stdout (pipe into jq)
+blescan --once           # scan 6 s, print the device table, then exit
+blescan --json           # scan 6 s, emit the devices as JSON on stdout (pipe into jq)
+blescan --stream         # NDJSON, one line per device per packet, until killed
 blescan --diag           # adapter + permission diagnostics
+blescan --json --window 20      # any headless mode: scan for 20 s instead
+blescan --stream --window=60    # …or stream for a minute, then exit
+blescan --version        # print the version
 blescan --help           # usage summary
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--once` | Single ~6 s scan; print the device table, then exit. |
-| `--json` | Single ~6 s scan; emit a JSON array on stdout (exit 3 if the adapter never powered on). |
-| `--diag` | Print adapter state, permission status and device/name counts. |
+| `--once` | Single scan (6 s); print the device table, then exit. |
+| `--json` | Single scan (6 s); emit a JSON array on stdout (exit 3 if the adapter never powered on). |
+| `--stream` | Emit [NDJSON](#json-output) for as long as the process runs — one line per device per packet, throttled to one line per device per second. Exit 3 if the adapter never powers on. |
+| `--diag` | Print version, adapter state, permission status and device/name counts (3 s scan). |
+| `--window N` | Seconds to scan in the headless modes (`--window=N` works too). For `--stream`, a stop time instead of running forever. |
+| `--version`, `-V` | Print the version. |
 | `--help`, `-h` | Show usage. |
 
 Everything else is a **live** TUI control (see [shortcuts](#keyboard-shortcuts)).
@@ -202,7 +212,10 @@ to force it off. **Truecolor** is used when the terminal advertises it
 | **Prox** | Proximity estimate: **immediate / near / far**, or `—` when not estimable. |
 | **Conn** | Whether the device advertises as connectable: `yes` / `no` / `?`. |
 | **Age** | Time since the last advertisement was heard. Rows fade as they go stale and are dropped after 60 s of silence. |
+| **Adv/s** | Advertisements per second over the last 5 s. A BLE‑specific tell: beacons and trackers advertise at a steady 1–10 Hz, phones idle low and burst; `—` once a device has been silent for a window. |
 | **Trend** | Sparkline of recent RSSI (last ~24 samples, ~1/s), so you can watch a device approach or recede. Wide terminals only. |
+
+Press `?` in the TUI for the same reference in‑app.
 
 **Signal colour key** (by dBm): bright‑green `≥ -55` · green `-55…-67` · yellow
 `-67…-77` · orange `-77…-87` · red `< -87`. On truecolor terminals this is a smooth
@@ -213,7 +226,8 @@ gradient rather than five steps.
 The bottom pane expands the **selected** device (move the selection with `j`/`k`, the
 arrows, the mouse wheel, or by clicking a row). It shows the host‑stable identifier, the
 full signal line (RSSI, proximity, estimated distance when a calibration is present, TX
-power, connectable, age), vendor and type, the **resolved service list**, any decoded
+power, connectable, age, when it was first heard, advert rate), vendor and type, the
+**resolved service list**, any decoded
 **iBeacon / Eddystone / Continuity** payloads, and a **hex dump of the raw manufacturer
 and service‑data bytes** — the advertisement exactly as it came off the air.
 
@@ -221,11 +235,12 @@ and service‑data bytes** — the advertisement exactly as it came off the air.
 
 | Key | Action | | Key | Action |
 |-----|--------|-|-----|--------|
-| `q` / `Ctrl‑C` / `Ctrl‑D` | quit | | `p` | sort by **p**ower (RSSI) |
+| `q` / `Ctrl‑C` / `Ctrl‑D` | quit (also mid‑filter) | | `p` | sort by **p**ower (RSSI) |
 | `j` / `k` / `↓` / `↑` | move selection | | `n` | sort by **n**ame |
 | `c` | **c**onnectable‑only toggle | | `v` | sort by **v**endor |
 | `u` | named‑only toggle | | `t` | sort by **t**ype |
 | `/` | **filter** (Enter apply, Esc clear) | | `g` | sort by a**g**e |
+| `?` | help overlay (keys + column legend) | | `r` | sort by advert **r**ate |
 | | | | | press a sort key again to reverse |
 
 ### Mouse
@@ -268,27 +283,33 @@ All of this lives in the framework‑free `Core.swift`, unit‑tested at **100% 
 
 ## JSON output
 
-`blescan --json` scans for a few seconds and prints a pretty array (sorted by RSSI,
-strongest first; keys alphabetised). Fields that aren't advertised are omitted — beacons
-add structured `iBeacon` / `eddystone` fields, `serviceData` carries the raw hex of each
-service‑data entry, `companyId` is the raw `0xXXXX`, and `rssi` is dropped when the radio
-reports it unavailable. If the adapter never reaches `poweredOn` (Bluetooth off, permission
-denied, no BLE support) the array is still printed, but a one‑line reason goes to stderr and
-the exit status is **3** — so a script never mistakes "the radio was off" for "nobody was
-advertising":
+`blescan --json` scans for `--window` seconds (default 6) and prints a pretty array
+(sorted by RSSI, strongest first; keys alphabetised). Fields that aren't advertised are
+omitted — beacons add structured `iBeacon` / `eddystone` fields, `serviceData` carries the
+raw hex of each service‑data entry, `companyId` is the raw `0xXXXX`, and `rssi` is dropped
+when the radio reports it unavailable. **`services` are raw normalised UUIDs** (the SIG
+short form, `180F`, or the full 128‑bit form) so a consumer can match on them; the display
+strings sit beside them in `serviceNames`. If the adapter never reaches `poweredOn`
+(Bluetooth off, permission denied, no BLE support) the array is still printed, but a
+one‑line reason goes to stderr and the exit status is **3** — so a script never mistakes
+"the radio was off" for "nobody was advertising":
 
 ```jsonc
 [
   {
+    "advertsPerSecond": 2.4,
     "companyId": "0x004C",
     "connectable": true,
     "continuity": ["AirPods / Proximity Pairing"],
+    "firstSeenSecondsAgo": 6,
     "id": "B6F5B1C0-1A2B-3C4D-5E6F-9A21C5D4E3F2",
+    "lastSeenSecondsAgo": 0,
     "manufacturerHex": "4c000719...",
     "name": "Lucas’ AirPods",
     "proximity": "immediate",
     "rssi": -41,
-    "services": ["Battery (0x180F)"],
+    "serviceNames": ["Battery (0x180F)"],
+    "services": ["180F"],
     "txPower": 12,
     "type": "AirPods / Apple audio",
     "vendor": "Apple"
@@ -300,6 +321,25 @@ Example — list every Apple device strongest‑first:
 
 ```sh
 blescan --json | jq -r '.[] | select(.vendor=="Apple") | "\(.rssi)\t\(.name // "(unnamed)")\t\(.type)"'
+```
+
+Example — everything advertising the Battery service:
+
+```sh
+blescan --json | jq -c '.[] | select(.services | index("180F")) | {name, vendor, rssi}'
+```
+
+### Streaming (`--stream`)
+
+`blescan --stream` emits the same object as **NDJSON** — one compact JSON document per
+line, flushed as it's written — for every packet heard, throttled to **at most one line
+per device per second** (allow‑duplicates delivers tens of packets a second from a chatty
+beacon; the throttle keeps the pipe readable). Each line adds `ts`, the wall‑clock time
+it was written. It runs until killed, or until `--window N` seconds elapse:
+
+```sh
+blescan --stream | jq -c 'select(.type == "Find My / AirTag") | {ts, id, rssi}'
+blescan --stream --window 300 > capture.ndjson        # five minutes, then exit
 ```
 
 ## Honesty notes & known limitations
@@ -365,22 +405,26 @@ ad‑hoc signature changes every build, the grant resets on each `make install`;
   delegate callbacks land off the main thread. Each `didDiscover` is turned into a
   framework‑free `Device` and handed to the app under a lock. No out‑of‑process helper is
   needed (BLE has no SSID‑redaction quirk to work around).
-- **App** (`main.swift`): the live device table, history ring buffers, UI state, and the
-  raw‑mode ANSI renderer (master table + detail pane), painted with synchronized output
-  and frame‑diffing so it never tears. It idles at near‑0% CPU when the radio is quiet; while
-  actively scanning it does a light ~10 fps redraw to animate the spinner and signal trace.
-- **Core** (`Core.swift`): all the pure logic — vendor/service/beacon fingerprinting, the
-  proximity model, colour, sorting, hex dump and display‑width‑aware text layout —
-  framework‑free and unit‑tested at 100%.
+- **App** (`main.swift`): the live device table, history ring buffers and rate meters, UI
+  state, and the raw‑mode ANSI renderer (master table + detail pane). Only the rows in the
+  viewport are rendered, and each frame is diffed line by line against the last so a tick
+  rewrites the rows that changed (the header's spinner and clock, an Age cell rolling over)
+  inside one synchronized‑output bracket — never the whole screen, never a tear. It idles at
+  near‑0% CPU when the radio is quiet; while scanning it animates at 5 fps.
+- **Core** (`Core.swift`): all the pure logic — vendor/service/beacon fingerprinting
+  (derived once per advertisement and cached on the `Device`, not recomputed per read), the
+  advert merge rules, the proximity model, advert‑rate meter, colour, sorting, hex dump,
+  display‑width‑aware text layout and command‑line parsing — framework‑free and unit‑tested
+  at 100%.
 
 ## Project layout
 
 ```
-Sources/blescan/Core.swift   pure logic — fingerprinting · proximity · colour · sorting · layout
+Sources/blescan/Core.swift   pure logic — fingerprinting · merge · rate · proximity · colour · sorting · layout · argv
 Sources/blescan/main.swift   CoreBluetooth (Radio) · TUI · entrypoint
 Tests/CoreTests.swift        dependency-free unit tests for Core (`make test`, 100% covered)
 scripts/check-coverage.sh    coverage gate — fails unless Core.swift is 100% region+line covered
-.github/workflows/ci.yml     GitHub Actions: build + test + coverage gate on every push/PR
+.github/workflows/ci.yml     GitHub Actions: debug + release build, tests, coverage gate on every push/PR
 Info.plist                   Bluetooth usage string, embedded into the binary at link time
 Makefile                     `make install` → signed blescan in ~/.bin; `make test` / `make coverage`
 Package.swift                SwiftPM manifest (for editors/tooling/CI; the Makefile uses swiftc)
@@ -402,10 +446,11 @@ make coverage              # run tests under llvm-cov; fails unless Core.swift i
 make clean                 # remove build artifacts (make uninstall removes ~/.bin/blescan)
 ```
 
-Two files: **`Core.swift`** holds the pure, framework‑free logic (fingerprinting,
-proximity, colour, sorting, hex dump, text layout, and terminal‑escape sanitization of
-hostile device names) and is unit‑tested standalone via `make test`; **`main.swift`**
-holds the `Radio` (CoreBluetooth wrapper) and the raw‑mode TUI.
+Two files: **`Core.swift`** holds the pure, framework‑free logic (fingerprinting, the
+advert merge rules, the rate meter, proximity, colour, sorting, hex dump, text layout,
+command‑line parsing, and terminal‑escape sanitization of hostile device names) and is
+unit‑tested standalone via `make test`; **`main.swift`** holds the `Radio` (CoreBluetooth
+wrapper), the raw‑mode TUI and the headless modes.
 
 `Core.swift` is held at **100% region + line coverage** — `make coverage` (and CI, on
 every push/PR) re‑runs the tests under `llvm-cov` and `scripts/check-coverage.sh` fails

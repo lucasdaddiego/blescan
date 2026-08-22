@@ -16,76 +16,140 @@ import Foundation
 // MARK: - Model
 
 /// One service-data entry: a service UUID and the bytes advertised under it.
-struct ServiceDatum {
+struct ServiceDatum: Equatable {
     var uuid: String     // normalised (short "FEAA" form when derived from the BT base UUID)
     var bytes: [UInt8]
 }
 
-/// A live device row, built from a CBPeripheral + its advertisementData dict. Holds the
-/// raw advertised fields; all fingerprinting is derived (computed) from them so the same
-/// values that render in the table also hex-dump verbatim in the detail pane.
-struct Device {
-    var id: String                    // CBPeripheral.identifier UUID (host-stable, NOT a MAC)
-    var name: String?                 // advertised local name (or the peripheral's GAP name)
-    var rssi: Int                     // dBm; 127 is CoreBluetooth's "unavailable" sentinel
-    var txPower: Int?                 // GAP TX Power Level (dBm), if advertised
-    var connectable: Bool?            // CBAdvertisementDataIsConnectable, if present
-    var manufacturerData: [UInt8]     // raw, including the leading 2-byte company id
-    var serviceUUIDs: [String]        // normalised service UUIDs
-    var serviceData: [ServiceDatum]
-    var solicitedUUIDs: [String]
-    var overflowUUIDs: [String]
-    var firstSeen: Double             // epoch seconds
-    var lastSeen: Double              // epoch seconds
-
-    // --- derived fingerprint (pure functions of the fields above) ---
-
+/// Everything derived from an advertisement's raw fields — computed ONCE per change (see
+/// `Device.absorb`) rather than on every access. Before this was cached, `typeLabel`,
+/// `vendor` and the beacon parsers re-ran on each read, and a frame reads them from the
+/// filter, twice per sort comparison and once more per rendered cell — tens of thousands
+/// of parses and Set allocations a second at 10 fps with a room full of devices.
+struct Fingerprint {
     /// Little-endian 2-byte company identifier from manufacturer data, if present.
-    var companyId: UInt16? { companyIdentifier(manufacturerData) }
-
+    let companyId: UInt16?
     /// Human vendor label: a curated SIG company name, else the raw `0xXXXX` id, else "—".
-    var vendor: String { vendorLabel(companyId) }
-
+    let vendor: String
     /// Parsed iBeacon (Apple manufacturer-data layout `4C 00 02 15 …`), if this is one.
-    var iBeacon: IBeacon? { parseIBeacon(manufacturerData) }
-
+    let iBeacon: IBeacon?
     /// Parsed Eddystone frame from the 0xFEAA service-data entry, if present.
-    var eddystone: Eddystone? {
-        guard let d = serviceData.first(where: { normalizeUUID($0.uuid) == "FEAA" }) else { return nil }
-        return parseEddystone(d.bytes)
-    }
-
+    let eddystone: Eddystone?
     /// Apple "Continuity" advertisement segment types present (iBeacon, AirPods, Find My …).
-    var continuityTypes: [UInt8] { appleSegmentTypes(manufacturerData) }
-
-    /// Service UUIDs in their normalised short form, as a set for quick membership tests.
-    var serviceShortSet: Set<String> {
-        Set((serviceUUIDs + serviceData.map { $0.uuid } + solicitedUUIDs + overflowUUIDs).map(normalizeUUID))
-    }
-
+    let continuityTypes: [UInt8]
+    /// Every service UUID source, normalised, as a set for quick membership tests.
+    let serviceShortSet: Set<String>
+    /// The services this device advertises, for listing: the service list first, then any
+    /// service-data keys not already in it, original order kept. Beacons routinely carry the
+    /// same UUID in both (an Eddystone advert lists FEAA and carries FEAA service data), so
+    /// a plain concatenation shows "Google Eddystone (0xFEAA)" twice.
+    let advertisedServices: [String]
     /// Best-guess device category from services + manufacturer signature.
-    var typeLabel: String {
-        inferDeviceType(serviceShortUUIDs: serviceShortSet, companyId: companyId,
-                        iBeacon: iBeacon != nil, eddystone: eddystone != nil,
-                        continuityTypes: Set(continuityTypes), name: name)
-    }
-
+    let typeLabel: String
     /// Calibrated RSSI at 1 m for ranging, when the advertisement provides a reference:
     /// iBeacon carries a 1 m measured-power byte directly; Eddystone carries a 0 m TX
     /// power, which the spec says to offset by ~41 dB to estimate the 1 m value. The bare
     /// GAP TX Power Level is the radiated power, not a 1 m reference, so it is NOT used
     /// here (we fall back to RSSI thresholds instead — see `proximity`).
-    var calibratedRSSIAt1m: Int? {
-        if let b = iBeacon { return b.measuredPower }
-        if let e = eddystone, let tx = e.txPower { return tx - 41 }
-        return nil
+    let calibratedRSSIAt1m: Int?
+
+    init(name: String?, manufacturerData: [UInt8], serviceUUIDs: [String],
+         serviceData: [ServiceDatum], solicitedUUIDs: [String], overflowUUIDs: [String]) {
+        companyId = companyIdentifier(manufacturerData)
+        vendor = vendorLabel(companyId)
+        iBeacon = parseIBeacon(manufacturerData)
+        eddystone = serviceData.first { normalizeUUID($0.uuid) == "FEAA" }.flatMap { parseEddystone($0.bytes) }
+        continuityTypes = appleSegmentTypes(manufacturerData)
+        serviceShortSet = Set((serviceUUIDs + serviceData.map { $0.uuid } + solicitedUUIDs + overflowUUIDs).map(normalizeUUID))
+        var seen = Set<String>()
+        advertisedServices = (serviceUUIDs + serviceData.map { $0.uuid }).filter { seen.insert(normalizeUUID($0)).inserted }
+        typeLabel = inferDeviceType(serviceShortUUIDs: serviceShortSet, companyId: companyId,
+                                    iBeacon: iBeacon != nil, eddystone: eddystone != nil,
+                                    continuityTypes: Set(continuityTypes), name: name)
+        if let b = iBeacon { calibratedRSSIAt1m = b.measuredPower }
+        else if let e = eddystone, let tx = e.txPower { calibratedRSSIAt1m = tx - 41 }
+        else { calibratedRSSIAt1m = nil }
     }
+}
+
+/// A live device row, built from a CBPeripheral + its advertisementData dict. Holds the
+/// raw advertised fields plus a `Fingerprint` derived from them; the raw fields only change
+/// through `absorb`, which re-derives the fingerprint, so the two can't drift apart and the
+/// same values that render in the table also hex-dump verbatim in the detail pane.
+struct Device {
+    let id: String                                // CBPeripheral.identifier UUID (host-stable, NOT a MAC)
+    private(set) var name: String?                // advertised local name (or the peripheral's GAP name)
+    private(set) var rssi: Int                    // dBm; 127 is CoreBluetooth's "unavailable" sentinel
+    private(set) var txPower: Int?                // GAP TX Power Level (dBm), if advertised
+    private(set) var connectable: Bool?           // CBAdvertisementDataIsConnectable, if present
+    private(set) var manufacturerData: [UInt8]    // raw, including the leading 2-byte company id
+    private(set) var serviceUUIDs: [String]       // normalised service UUIDs
+    private(set) var serviceData: [ServiceDatum]
+    private(set) var solicitedUUIDs: [String]
+    private(set) var overflowUUIDs: [String]
+    var firstSeen: Double                         // monotonic seconds (see `now()` in main.swift)
+    var lastSeen: Double                          // monotonic seconds
+    var advertsPerSecond: Double                  // stamped by the app from its AdvertRate meter
+    private(set) var fingerprint: Fingerprint
+
+    init(id: String, name: String?, rssi: Int, txPower: Int?, connectable: Bool?,
+         manufacturerData: [UInt8], serviceUUIDs: [String], serviceData: [ServiceDatum],
+         solicitedUUIDs: [String], overflowUUIDs: [String],
+         firstSeen: Double, lastSeen: Double, advertsPerSecond: Double = 0) {
+        self.id = id; self.name = name; self.rssi = rssi; self.txPower = txPower
+        self.connectable = connectable; self.manufacturerData = manufacturerData
+        self.serviceUUIDs = serviceUUIDs; self.serviceData = serviceData
+        self.solicitedUUIDs = solicitedUUIDs; self.overflowUUIDs = overflowUUIDs
+        self.firstSeen = firstSeen; self.lastSeen = lastSeen
+        self.advertsPerSecond = advertsPerSecond
+        fingerprint = Fingerprint(name: name, manufacturerData: manufacturerData,
+                                  serviceUUIDs: serviceUUIDs, serviceData: serviceData,
+                                  solicitedUUIDs: solicitedUUIDs, overflowUUIDs: overflowUUIDs)
+    }
+
+    /// Merge a fresh advertisement from the same peripheral, heard at `t`. Adverts and scan
+    /// responses carry different subsets of the fields, so each one is kept from the last
+    /// packet that actually carried it (an empty list means "not in this packet", not
+    /// "gone"). The fingerprint is re-derived only when a field it depends on changed.
+    mutating func absorb(_ u: Device, at t: Double) {
+        var changed = false
+        func take<T: Equatable>(_ field: inout T, _ value: T) { if field != value { field = value; changed = true } }
+        if let n = u.name { take(&name, n) }
+        rssi = u.rssi
+        if let tx = u.txPower { txPower = tx }
+        if let c = u.connectable { connectable = c }
+        if !u.manufacturerData.isEmpty { take(&manufacturerData, u.manufacturerData) }
+        if !u.serviceUUIDs.isEmpty { take(&serviceUUIDs, u.serviceUUIDs) }
+        if !u.serviceData.isEmpty { take(&serviceData, u.serviceData) }
+        if !u.solicitedUUIDs.isEmpty { take(&solicitedUUIDs, u.solicitedUUIDs) }
+        if !u.overflowUUIDs.isEmpty { take(&overflowUUIDs, u.overflowUUIDs) }
+        lastSeen = t
+        if changed {
+            fingerprint = Fingerprint(name: name, manufacturerData: manufacturerData,
+                                      serviceUUIDs: serviceUUIDs, serviceData: serviceData,
+                                      solicitedUUIDs: solicitedUUIDs, overflowUUIDs: overflowUUIDs)
+        }
+    }
+
+    // --- derived fingerprint, read through the cache ---
+    var companyId: UInt16? { fingerprint.companyId }
+    var vendor: String { fingerprint.vendor }
+    var iBeacon: IBeacon? { fingerprint.iBeacon }
+    var eddystone: Eddystone? { fingerprint.eddystone }
+    var continuityTypes: [UInt8] { fingerprint.continuityTypes }
+    var serviceShortSet: Set<String> { fingerprint.serviceShortSet }
+    var advertisedServices: [String] { fingerprint.advertisedServices }
+    var typeLabel: String { fingerprint.typeLabel }
+    var calibratedRSSIAt1m: Int? { fingerprint.calibratedRSSIAt1m }
 
     /// Proximity bucket (immediate / near / far / unknown) from RSSI + any 1 m reference.
     var proximityBucket: Proximity { proximity(rssi: rssi, calibratedRSSIAt1m: calibratedRSSIAt1m) }
 
     /// Seconds since this device was last heard from, given a reference "now".
     func age(now: Double) -> Double { max(0, now - lastSeen) }
+
+    /// Seconds since this device was first heard, given a reference "now".
+    func seenFor(now: Double) -> Double { max(0, now - firstSeen) }
 
     /// Name for display — the advertised name, or a dim placeholder when unnamed.
     var displayName: String {
@@ -103,11 +167,6 @@ struct Device {
 func companyIdentifier(_ raw: [UInt8]) -> UInt16? {
     guard raw.count >= 2 else { return nil }
     return UInt16(raw[0]) | (UInt16(raw[1]) << 8)
-}
-
-/// Manufacturer-specific payload — the bytes after the 2-byte company id.
-func manufacturerPayload(_ raw: [UInt8]) -> [UInt8] {
-    raw.count > 2 ? Array(raw[2...]) : []
 }
 
 /// Vendor label for a company id: the curated SIG name, else the raw hex id, else "—"
@@ -342,7 +401,7 @@ func proximity(rssi: Int, calibratedRSSIAt1m ref: Int?) -> Proximity {
 // MARK: - Sorting
 
 enum SortKey {
-    case rssi, name, vendor, type, age
+    case rssi, name, vendor, type, age, rate
     var label: String {
         switch self {
         case .rssi:   return "RSSI"
@@ -350,6 +409,7 @@ enum SortKey {
         case .vendor: return "Vendor"
         case .type:   return "Type"
         case .age:    return "Age"
+        case .rate:   return "Rate"
         }
     }
 }
@@ -383,6 +443,8 @@ func deviceBefore(_ a: Device, _ b: Device, by key: SortKey) -> Bool {
         return a.typeLabel != b.typeLabel ? a.typeLabel < b.typeLabel : rssiThenID(a, b)
     case .age:
         return a.lastSeen != b.lastSeen ? a.lastSeen > b.lastSeen : rssiThenID(a, b)
+    case .rate:
+        return a.advertsPerSecond != b.advertsPerSecond ? a.advertsPerSecond > b.advertsPerSecond : rssiThenID(a, b)
     }
 }
 
@@ -411,9 +473,6 @@ func normalizeUUID(_ s: String) -> String {
     }
     return u
 }
-
-/// Friendly service name for a UUID, e.g. "Heart Rate", or nil if unknown.
-func serviceName(_ uuid: String) -> String? { gattServiceNames[normalizeUUID(uuid)] }
 
 /// "Heart Rate (0x180D)" for known services; the raw (normalised) UUID otherwise.
 func friendlyService(_ uuid: String) -> String {
@@ -549,6 +608,43 @@ func formatAge(_ seconds: Double) -> String {
     return "\(Int(seconds / 3600))h"
 }
 
+// MARK: - Advertisement rate
+
+/// Adverts-per-second meter for one device: a sliding window over the timestamps of the
+/// last `window` seconds. Rate is a BLE-specific tell — a tracker beacons at a steady 1–10
+/// Hz, a phone idles at a fraction of that and bursts when it has something to say — and
+/// it is what `allowDuplicates` buys us, so it is worth a column.
+struct AdvertRate {
+    static let window: Double = 5
+
+    private var stamps: [Double] = []
+    private var first: Double?
+
+    mutating func record(at t: Double) {
+        if first == nil { first = t }
+        let cutoff = t - Self.window
+        stamps = Array(stamps.drop { $0 <= cutoff }) + [t]
+    }
+
+    /// Adverts per second over the last `window` seconds — or, for a device first heard
+    /// less than a window ago, over the time it has been audible (floored at 1 s so a
+    /// single packet can't read as hundreds per second). 0 once the window has drained.
+    func perSecond(at t: Double) -> Double {
+        guard let first = first else { return 0 }
+        let cutoff = t - Self.window
+        let recent = stamps.reversed().prefix { $0 > cutoff }.count
+        return Double(recent) / max(1.0, min(Self.window, t - first))
+    }
+}
+
+/// Compact adverts/s for a 5-cell column: `—` when silent, one decimal below 10, whole
+/// numbers above.
+func formatRate(_ perSecond: Double) -> String {
+    if perSecond <= 0 { return "—" }
+    let tenths = (perSecond * 10).rounded() / 10   // decide the form AFTER rounding: 9.96 → "10", not "10.0"
+    return tenths >= 10 ? String(format: "%.0f", tenths) : String(format: "%.1f", tenths)
+}
+
 // MARK: - Display-width-aware text layout
 //
 // Terminal cells, not grapheme counts: CJK/emoji glyphs occupy two columns but count as
@@ -656,6 +752,58 @@ func sanitizeName(_ s: String) -> String {
     return String(out)
 }
 
+// MARK: - Command line
+
+enum Mode: Equatable { case tui, once, json, stream, diag, help, version }
+
+/// Parsed command line. `window` is the headless scan length in seconds when given
+/// (`--window N` / `--window=N`); each mode picks its own default otherwise.
+struct Options: Equatable {
+    var mode: Mode = .tui
+    var window: Double?
+}
+
+/// A command-line usage error: the message to print on stderr before exiting 2.
+struct UsageError: Error, Equatable { let message: String }
+
+/// Parse argv (without argv[0]). The modes are mutually exclusive; the last one wins only
+/// for `--help` / `--version`, which short-circuit — otherwise two modes is an error, as is
+/// a window that isn't a positive number. Returns the usage error text to print on failure.
+func parseArguments(_ args: [String]) -> Result<Options, UsageError> {
+    let modeFlags: [String: Mode] = ["--once": .once, "--json": .json, "--stream": .stream, "--diag": .diag]
+    var opts = Options()
+    var modeFlag: String?
+    var i = 0
+    while i < args.count {
+        let a = args[i]; i += 1
+        if a == "--help" || a == "-h" { return .success(Options(mode: .help)) }
+        if a == "--version" || a == "-V" { return .success(Options(mode: .version)) }
+        if let m = modeFlags[a] {
+            if let other = modeFlag, other != a {
+                return .failure(UsageError(message: "error: \(other) and \(a) are mutually exclusive (see --help)"))
+            }
+            opts.mode = m; modeFlag = a
+        } else if a == "--window" || a.hasPrefix("--window=") {
+            let raw: String
+            if a == "--window" {
+                guard i < args.count else {
+                    return .failure(UsageError(message: "error: --window needs a number of seconds (see --help)"))
+                }
+                raw = args[i]; i += 1
+            } else {
+                raw = String(a.dropFirst("--window=".count))
+            }
+            guard let w = Double(raw), w.isFinite, w > 0 else {
+                return .failure(UsageError(message: "error: --window must be a positive number of seconds, got '\(raw)'"))
+            }
+            opts.window = w
+        } else {
+            return .failure(UsageError(message: "error: unknown option '\(a)' (see --help)"))
+        }
+    }
+    return .success(opts)
+}
+
 // MARK: - Headless scan outcome
 
 /// Diagnostic for a headless (`--json`) scan whose adapter never reached
@@ -679,6 +827,10 @@ func headlessScanFailure(poweredOn: Bool, state: String, authorization: String) 
 /// Curated SIG "Company Identifiers" → name. nil ⇒ caller shows the raw hex id.
 func companyName(_ id: UInt16) -> String? { sigCompanies[id] }
 
+// Kept in numeric order so a new entry has one obvious home and a duplicate id is caught by
+// eye (a duplicate key would trap at startup — the dictionary literal is evaluated eagerly).
+// Names are the consumer-facing brand, not the SIG's full legal entity ("Apple", not
+// "Apple, Inc."); the official list is the SIG's company_identifiers.yaml.
 private let sigCompanies: [UInt16: String] = [
     0x0000: "Ericsson Technology Licensing",
     0x0001: "Nokia Mobile Phones",
@@ -692,19 +844,94 @@ private let sigCompanies: [UInt16: String] = [
     0x000D: "Texas Instruments",
     0x000F: "Broadcom",
     0x0013: "Atmel",
+    0x0025: "NXP",
+    0x0030: "STMicroelectronics",
+    0x003A: "Panasonic",
+    0x0046: "MediaTek",
     0x004C: "Apple",
+    0x0055: "Plantronics",
+    0x0057: "Harman International",
     0x0059: "Nordic Semiconductor",
+    0x005C: "Belkin",
+    0x005D: "Realtek Semiconductor",
+    0x0065: "HP",
+    0x006B: "Polar Electro",
     0x0075: "Samsung Electronics",
+    0x0077: "Laird Connectivity",
     0x0078: "Nike",
     0x0087: "Garmin",
+    0x009E: "Bose",
+    0x009F: "Suunto",
     0x00C4: "LG Electronics",
+    0x00CC: "Beats Electronics",
+    0x00CD: "Microchip Technology",
+    0x00CE: "Eve Systems",
+    0x00D0: "Dexcom",
     0x00D7: "Qualcomm Connected Experiences",
     0x00E0: "Google",
-    0x0157: "Anhui Huami (Amazfit / Zepp)",
-    0x0171: "Amazon",
+    0x0103: "Bang & Olufsen",
+    0x0118: "Radius Networks",
     0x012D: "Sony",
+    0x0131: "Cypress Semiconductor",
+    0x0155: "Netatmo",
+    0x0157: "Anhui Huami (Amazfit / Zepp)",
+    0x015D: "Estimote",
+    0x0171: "Amazon",
+    0x0178: "Casio",
+    0x018E: "Google",
+    0x01AB: "Meta Platforms",
+    0x01D1: "August Home",
+    0x01DA: "Logitech",
+    0x01F1: "Zebra Technologies",
+    0x01FC: "Wahoo Fitness",
+    0x01FD: "Kontakt.io",
+    0x020E: "Omron Healthcare",
+    0x0211: "Telink Semiconductor",
+    0x022B: "Tesla",
+    0x027D: "Huawei",
+    0x02B2: "Oura Health",
+    0x02C5: "Lenovo",
+    0x02E5: "Espressif Systems",
+    0x02F2: "GoPro",
+    0x02FF: "Silicon Labs",
+    0x030F: "Shortcut Labs (Flic)",
+    0x038F: "Xiaomi",
+    0x03FF: "Withings",
+    0x041E: "Dell",
+    0x044A: "Shimano",
+    0x0494: "Sennheiser",
     0x0499: "Ruuvi Innovations",
+    0x04AD: "Shure",
+    0x04DE: "Lutron Electronics",
+    0x0500: "Wiliot",
+    0x0526: "Honeywell",
+    0x0553: "Nintendo",
+    0x055D: "Valve",
+    0x058E: "Meta Platforms Technologies",
+    0x05A7: "Sonos",
+    0x060F: "Signify (Philips Hue)",
+    0x0618: "Audio-Technica",
+    0x067C: "Tile",
+    0x068E: "Razer",
+    0x0723: "Ford Motor",
+    0x072F: "OnePlus",
+    0x0768: "Peloton",
+    0x07A2: "Roku",
+    0x07C9: "Skullcandy",
+    0x07D0: "Tuya",
+    0x080B: "Nanoleaf",
     0x0822: "Adafruit Industries",
+    0x0837: "vivo",
+    0x0870: "Wyze Labs",
+    0x08A4: "Realme",
+    0x08C3: "Chipolo",
+    0x0933: "SRAM",
+    0x0941: "Rivian Automotive",
+    0x094A: "Zwift",
+    0x09C6: "Honor",
+    0x0A12: "Dyson",
+    0x0A82: "Corsair",
+    0x0B27: "Lumi United (Aqara)",
 ]
 
 /// Curated SIG GATT service UUIDs (16-bit) + common member service UUIDs → friendly name.
@@ -762,5 +989,19 @@ private let gattServiceNames: [String: String] = [
     "FD43": "Apple",
     "FE95": "Xiaomi",
     "FEBE": "Bose",
+    "FE9F": "Google",
+    "FEAF": "Nest",
+    "FE07": "Sonos",
+    "FE0F": "Signify (Philips Hue)",
+    "FE59": "Nordic Secure DFU",
+    "FE78": "HP",
+    "FDF7": "HP",
+    "FD82": "Sony",
+    "FD5A": "Samsung",
+    "FEE0": "Anhui Huami (Amazfit / Zepp)",
+    "FDAB": "Xiaomi",
+    "FE9A": "Estimote",
+    "FEBB": "Adafruit",
+    "FEF5": "Dialog Semiconductor",
     nordicUARTService: "Nordic UART (NUS)",
 ]
