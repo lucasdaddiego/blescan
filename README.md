@@ -7,7 +7,7 @@
 [![CI](https://github.com/lucasdaddiego/blescan/actions/workflows/ci.yml/badge.svg)](https://github.com/lucasdaddiego/blescan/actions/workflows/ci.yml)
 ![coverage](https://img.shields.io/badge/coverage-100%25-brightgreen?logo=swift&logoColor=white)
 ![platform](https://img.shields.io/badge/platform-macOS%2012%2B-black?logo=apple)
-![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange?logo=swift&logoColor=white)
+![Swift](https://img.shields.io/badge/Swift-6-orange?logo=swift&logoColor=white)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![last commit](https://img.shields.io/github/last-commit/lucasdaddiego/blescan?logo=git&logoColor=white)](https://github.com/lucasdaddiego/blescan/commits/master)

@@ -68,16 +68,26 @@ build: $(BINARY) ## Build the optimised, signed ./blescan (no install)
 # plist, or the build flags (this Makefile) actually change. Stripping happens at
 # link time, so we code-sign the final stripped Mach-O — `build`, `run` and `diag`
 # then use this locally-signed binary directly.
+#
+# Link + sign under .build/, NOT in the repo root: codesign treats a directory that
+# holds an Info.plist naming a sibling file as its CFBundleExecutable as a flat
+# bundle — exactly what the repo root looks like once ./blescan exists. Signing the
+# binary there "signs the bundle" instead: it seals the whole tree into a
+# _CodeSignature/CodeResources beside the sources, leaves the embedded plist unbound,
+# and fails outright on anything it can't seal (git's fsmonitor socket in .git/).
+# Signed as a bare Mach-O the seal lives in the file, so the move keeps it intact.
 $(BINARY): $(SRC) $(PLIST) Makefile
-	$(SWIFTC) $(SWIFTFLAGS) $(RELEASE) $(EMBED_PLIST) $(SRC) -o $@ $(FRAMEWORKS)
-	codesign --force --sign $(SIGN) --identifier $(BUNDLE_ID) $@
+	@mkdir -p "$(BUILD_DIR)"
+	$(SWIFTC) $(SWIFTFLAGS) $(RELEASE) $(EMBED_PLIST) $(SRC) -o "$(BUILD_DIR)/$(BINARY)" $(FRAMEWORKS)
+	codesign --force --sign $(SIGN) --identifier $(BUNDLE_ID) "$(BUILD_DIR)/$(BINARY)"
+	mv -f "$(BUILD_DIR)/$(BINARY)" $@
 	@echo "built ./$@ ($$(du -h $@ | cut -f1)), signed as '$(SIGN)'"
 
-# Copy, then re-sign in place. A copied Mach-O fails strict signature verification
-# (macOS quirk — cp/ditto/install all trigger it, even byte-identical on the same
-# volume), so re-sign at the destination to give the installed binary a clean
-# signature and Bluetooth TCC identity. (Stability across rebuilds still needs a
-# real SIGN cert, per the note above; ad-hoc re-keys every build.)
+# Copy, then re-sign in place. The copy already carries a valid signature (the seal
+# lives in the Mach-O now that ./blescan is signed as a bare binary, see above); the
+# re-sign is belt-and-braces so the installed file's signature and Bluetooth TCC
+# identity never depend on what the copy step did. (Stability across rebuilds still
+# needs a real SIGN cert, per the note above; ad-hoc re-keys every build.)
 install: $(BINARY) ## Build and install blescan into ~/.bin
 	@mkdir -p "$(INSTALL_DIR)"
 	cp -f "$(BINARY)" "$(INSTALL_DIR)/$(BINARY)"
