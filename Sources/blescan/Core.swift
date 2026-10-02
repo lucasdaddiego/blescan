@@ -850,6 +850,21 @@ func padLeft(_ s: String, _ n: Int) -> String {
     return String(repeating: " ", count: max(0, n - displayWidth(t))) + t
 }
 
+/// Bytes that repaint a whole frame: clear, home, then every row. A full clear leaves
+/// nothing to erase per row, and an erase sent after a row that fills the terminal would
+/// wipe that row's last cell (see `repaintRow`).
+func fullRepaint(_ rows: [String]) -> String {
+    "\u{1B}[2J\u{1B}[H" + rows.joined(separator: "\r\n")
+}
+
+/// Bytes that rewrite screen row `row` (1-based): erase the old row FIRST, then write. An
+/// erase-to-end (`ESC[K`) sent after a row exactly as wide as the terminal finds the cursor
+/// parked on the last column (pending wrap) and erases that cell — the last digit of the
+/// right-aligned Adv/s column at 99–115 columns, and the end of every full-width rule.
+func repaintRow(_ row: Int, _ line: String) -> String {
+    "\u{1B}[\(row);1H\u{1B}[2K" + line
+}
+
 /// From `variants` ordered richest-first, the first whose display width fits `n` columns,
 /// else the last (narrowest) as a floor — the caller clips that if even it overflows. Lets
 /// a single-line hint shed detail as the terminal narrows instead of truncating mid-word.

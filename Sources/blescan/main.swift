@@ -960,10 +960,10 @@ private func paint(_ app: App, _ lines: [String], _ layout: Layout) {
     let sizeChanged = layout.cols != app.lastCols || layout.rows != app.lastRows
     var screen = ""
     if sizeChanged || painted.count != app.lastLines.count {
-        screen = "\u{1B}[2J\u{1B}[H" + painted.map { $0 + "\u{1B}[K" }.joined(separator: "\r\n")
+        screen = fullRepaint(painted)
     } else {
         for (i, line) in painted.enumerated() where line != app.lastLines[i] {
-            screen += "\u{1B}[\(i + 1);1H" + line + "\u{1B}[K"
+            screen += repaintRow(i + 1, line)
         }
         if screen.isEmpty { return }
     }

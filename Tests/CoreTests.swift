@@ -479,6 +479,13 @@ let ibeaconBytes: [UInt8] =
         eq(padLeft("ab", 4), "  ab", "padLeft pads left")
         eq(padLeft("hello", 3), "hel", "padLeft truncates")
         eq(displayWidth(padLeft("你好", 3)), 3, "padLeft truncates wide without overflow")
+
+        // Frame output: never an erase-to-end AFTER a row. A row as wide as the terminal
+        // parks the cursor on its last cell, and ESC[K there erases it (the Adv/s digit).
+        eq(repaintRow(3, "ab"), "\u{1B}[3;1H\u{1B}[2Kab", "row repaint erases first, then writes")
+        ok(!repaintRow(1, "x").hasSuffix("\u{1B}[K"), "no erase-to-end after the row's content")
+        eq(fullRepaint(["a", "b"]), "\u{1B}[2J\u{1B}[Ha\r\nb", "full repaint: clear, home, rows")
+        ok(!fullRepaint(["a"]).contains("\u{1B}[K"), "full repaint sends no per-row erase")
     }
 
     // MARK: Width-fitting variant selection
