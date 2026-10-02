@@ -928,6 +928,37 @@ func sanitizeName(_ s: String) -> String {
     return String(out)
 }
 
+// MARK: - Keyboard input (UTF-8)
+//
+// The terminal sends a non-ASCII key (é, ñ, 日, an emoji) as one UTF-8 sequence. The raw
+// reader takes one byte at a time, so it needs to know how many bytes a lead byte starts
+// and whether the finished sequence is a key a filter can hold.
+
+/// Total byte length of the UTF-8 sequence `lead` starts, or nil for a byte that cannot
+/// start one: a continuation byte (80–BF), or a lead UTF-8 forbids (C0, C1, F5–FF).
+func utf8SequenceLength(lead: UInt8) -> Int? {
+    switch lead {
+    case 0x00...0x7F: return 1
+    case 0xC2...0xDF: return 2
+    case 0xE0...0xEF: return 3
+    case 0xF0...0xF4: return 4
+    default:          return nil
+    }
+}
+
+/// The key one complete UTF-8 sequence spells, or nil when the bytes are not valid UTF-8
+/// (truncated, overlong, a surrogate), are not exactly one character, or are not printable
+/// text: a control or format character that `sanitizeName` would hide paints in a width
+/// `charDisplayWidth` does not count, so it would misalign the filter line.
+func decodeKey(_ bytes: [UInt8]) -> Character? {
+    let s = String(decoding: bytes, as: UTF8.self)   // invalid input decodes to U+FFFD …
+    guard Array(s.utf8) == bytes,                    // … so a lossless round trip = valid
+          s.count == 1, let c = s.first,
+          sanitizeName(s) == s
+    else { return nil }
+    return c
+}
+
 // MARK: - Command line
 
 enum Mode: Equatable { case tui, once, json, stream, diag, help, version }

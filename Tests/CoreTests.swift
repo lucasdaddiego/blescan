@@ -60,6 +60,7 @@ let ibeaconBytes: [UInt8] =
         testLayout()
         testFittingVariant()
         testSanitize()
+        testKeyInput()
         testHeadlessOutcome()
         testDevice()
         testAbsorb()
@@ -511,6 +512,35 @@ let ibeaconBytes: [UInt8] =
     }
 
     // MARK: Terminal-safe names
+
+    // MARK: Keyboard input (UTF-8)
+
+    static func testKeyInput() {
+        eq(utf8SequenceLength(lead: 0x41), 1, "ASCII is one byte")
+        eq(utf8SequenceLength(lead: 0xC3), 2, "é-style lead → 2 bytes")
+        eq(utf8SequenceLength(lead: 0xE6), 3, "CJK lead → 3 bytes")
+        eq(utf8SequenceLength(lead: 0xF0), 4, "emoji lead → 4 bytes")
+        for bad: UInt8 in [0x80, 0xBF, 0xC0, 0xC1, 0xF5, 0xFF] {
+            ok(utf8SequenceLength(lead: bad) == nil, "0x\(String(bad, radix: 16)) cannot start a sequence")
+        }
+
+        eq(decodeKey([0xC3, 0xA9]), "é", "2-byte key")
+        eq(decodeKey([0xC3, 0xB1]), "ñ", "ñ")
+        eq(decodeKey([0xE6, 0x97, 0xA5]), "日", "3-byte key")
+        eq(decodeKey([0xF0, 0x9F, 0x98, 0x80]), "😀", "4-byte key")
+        ok(decodeKey([0xC3]) == nil, "truncated sequence")
+        ok(decodeKey([0xE0, 0x80, 0x80]) == nil, "overlong encoding")
+        ok(decodeKey([0xED, 0xA0, 0x80]) == nil, "UTF-16 surrogate")
+        ok(decodeKey([0x41, 0x42]) == nil, "two characters are not one key")
+        ok(decodeKey([]) == nil, "no bytes")
+        // Not text a filter can hold: a C1 control (NEL) and a Cf format character (LRM)
+        // would paint in a width charDisplayWidth does not count.
+        ok(decodeKey([0xC2, 0x85]) == nil, "C1 control")
+        ok(decodeKey([0xE2, 0x80, 0x8E]) == nil, "Cf format character")
+        // A decoded key measures by the repo's width rule like any other text.
+        eq(charDisplayWidth(decodeKey([0xE6, 0x97, 0xA5])!), 2, "CJK key is two columns")
+        eq(displayWidth("filter: " + "café"), 12, "accented filter text is one column per letter")
+    }
 
     static func testSanitize() {
         eq(sanitizeName("AirPods Pro"), "AirPods Pro", "printable name unchanged")

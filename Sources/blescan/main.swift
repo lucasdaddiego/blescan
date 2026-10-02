@@ -655,7 +655,18 @@ private func readByte() -> UInt8? {
 private func readInput() -> Input {
     guard let b = readByte() else { return .none }
     if b != 0x1B {
-        return b < 0x80 ? .key(Character(UnicodeScalar(b))) : .none
+        if b < 0x80 { return .key(Character(UnicodeScalar(b))) }
+        // A non-ASCII key (é, ñ, 日 …) arrives as one UTF-8 sequence: read its tail.
+        guard let n = utf8SequenceLength(lead: b) else { return .none }
+        var bytes = [b]
+        while bytes.count < n {
+            guard let c = readByte() else { return .none }
+            // Not a continuation byte: the sequence was cut short. Keep the byte for the
+            // next read (it may be an Esc or a plain key) instead of swallowing it.
+            guard c & 0xC0 == 0x80 else { pushedBack = c; return .none }
+            bytes.append(c)
+        }
+        return decodeKey(bytes).map { .key($0) } ?? .none
     }
     guard let b1 = readByte() else { return .key("\u{1B}") }   // lone Esc
     // CSI (ESC [ …) or SS3 (ESC O …): arrows arrive as the latter in application-cursor
