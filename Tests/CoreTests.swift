@@ -260,6 +260,12 @@ let ibeaconBytes: [UInt8] =
         // worse than the same device advertising no calibration at all.
         eq(proximity(rssi: -50, calibratedRSSIAt1m: 0), .immediate, "ref 0 → falls back to RSSI")
         eq(proximity(rssi: -95, calibratedRSSIAt1m: 0), .far, "ref 0 → RSSI threshold, far end")
+        // A positive 1 m reference is a bad beacon value (no radio hears its own signal
+        // above 0 dBm at 1 m). The ratio goes negative and pow(ratio, 10) explodes, so
+        // -50 dBm with a +20 reference read as ~9.5 km. It is unusable, like 0.
+        ok(estimateDistanceMeters(rssi: -50, calibratedRSSIAt1m: 20) == -1, "positive ref → invalid distance")
+        ok(estimateDistanceMeters(rssi: -90, calibratedRSSIAt1m: 1) == -1, "small positive ref → invalid distance")
+        eq(proximity(rssi: -50, calibratedRSSIAt1m: 20), .immediate, "positive ref → falls back to RSSI")
         // proximity without a reference (RSSI thresholds)
         eq(proximity(rssi: -50, calibratedRSSIAt1m: nil), .immediate, "no ref → immediate")
         eq(proximity(rssi: -70, calibratedRSSIAt1m: nil), .near, "no ref → near")
@@ -750,6 +756,35 @@ let ibeaconBytes: [UInt8] =
         var e = dev(id: "E", mfg: ibeaconBytes, first: 5001, last: 5001)
         linker.link(&e)
         eq(e.previousID, "D", "forgetting unrelated ids keeps the key")
+
+        // Two beacons on air at once with the same payload (a cloned configuration). The
+        // newcomer reads as a rotation on first sight (nothing tells them apart yet), but
+        // an id the linker already knows is never re-linked — or each advert would point
+        // the two at each other in turn and "previously" would flip back and forth.
+        var twins = IdentityLinker()
+        var x = dev(id: "X", mfg: ibeaconBytes, first: 1, last: 1)
+        var y = dev(id: "Y", mfg: ibeaconBytes, first: 2, last: 2)
+        twins.link(&x)
+        twins.link(&y)
+        eq(y.previousID, "X", "a newcomer under a known key links once")
+        twins.link(&x)
+        twins.link(&y)
+        twins.link(&x)
+        ok(x.previousID == nil && x.firstSeen == 1, "the original is never linked to the newcomer")
+        eq(y.previousID, "X", "…and the newcomer's link does not flip")
+        // A pruned id that comes back is a new row, so it may link again.
+        twins.forget(ids: ["X"])
+        var x2 = dev(id: "X", mfg: ibeaconBytes, first: 50, last: 50)
+        twins.link(&x2)
+        eq(x2.previousID, "Y", "a pruned id is forgotten, not barred")
+        // A known id whose payload changes to a key nobody holds still claims that key.
+        let otherBeacon: [UInt8] = [0x4C, 0x00, 0x02, 0x15] + Array(repeating: 0x02, count: 16) + [0x00, 0x01, 0x00, 0x01, 0xC5]
+        var y2 = dev(id: "Y", mfg: otherBeacon, first: 2, last: 70)
+        twins.link(&y2)
+        ok(y2.previousID == nil, "a known id moving to a new key is not a rotation")
+        var w = dev(id: "W", mfg: otherBeacon, first: 80, last: 80)
+        twins.link(&w)
+        eq(w.previousID, "Y", "…but it does claim the key it moved to")
 
         eq(beaconIdentity(iBeacon: nil, eddystone: .uid(txPower: 0, namespace: "ns", instance: "i")), "eddystone-uid:ns/i", "UID key")
         eq(beaconIdentity(iBeacon: nil, eddystone: .url(txPower: 0, url: "https://x")), "eddystone-url:https://x", "URL key")

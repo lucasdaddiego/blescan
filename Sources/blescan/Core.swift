@@ -250,16 +250,22 @@ func beaconIdentity(iBeacon: IBeacon?, eddystone: Eddystone?) -> String? {
 /// `firstSeen` (the "first heard" age survives the rotation) and records `previousID`.
 struct IdentityLinker {
     private var last: [String: (id: String, firstSeen: Double)] = [:]
+    /// Every id the linker has handled. Only a newcomer can be a rotation: an id it already
+    /// knows is a beacon still on air. Without this, two beacons broadcasting the same
+    /// payload at once (a cloned configuration) took the key from each other on every
+    /// advert, so each pointed at the other in turn and "previously" flipped back and forth.
+    private var known: Set<String> = []
 
-    /// Call on every ingest; a dictionary lookup when nothing changed. Mutates `d` in place
-    /// when its key was last seen under a different id.
+    /// Call on every ingest; a dictionary and a set lookup when nothing changed. Mutates `d`
+    /// in place when it is new and its key was last seen under a different id.
     mutating func link(_ d: inout Device) {
         guard let key = d.beaconKey else { return }
         if let prior = last[key] {
-            if prior.id == d.id { return }
+            if prior.id == d.id || known.contains(d.id) { return }
             d.previousID = prior.id
             d.firstSeen = min(d.firstSeen, prior.firstSeen)
         }
+        known.insert(d.id)
         last[key] = (d.id, d.firstSeen)
     }
 
@@ -269,6 +275,7 @@ struct IdentityLinker {
     /// beacon is genuinely gone. Without this the map grows with every rotation, forever.
     mutating func forget(ids: Set<String>) {
         last = last.filter { !ids.contains($0.value.id) }
+        known.subtract(ids)
     }
 }
 
@@ -503,8 +510,12 @@ enum Proximity: Equatable {
 /// Path-loss distance estimate (metres) from RSSI and a 1 m-calibrated reference RSSI,
 /// using the well-known iBeacon ranging curve. Only as good as the calibration and the
 /// environment — surfaced as a rough estimate, never a precise measurement.
+///
+/// A reference of 0 or above is unusable: no receiver hears a beacon above 0 dBm at 1 m, so
+/// it is a bad beacon value, and a positive one makes the ratio negative and the curve
+/// absurd (-50 dBm against +20 read as ~9.5 km). Both answer the -1 "unknown" sentinel.
 func estimateDistanceMeters(rssi: Int, calibratedRSSIAt1m ref: Int) -> Double {
-    if rssi == 0 || ref == 0 { return -1 }
+    if rssi == 0 || ref >= 0 { return -1 }
     let ratio = Double(rssi) / Double(ref)
     if ratio < 1.0 { return pow(ratio, 10.0) }
     return 0.89976 * pow(ratio, 7.7095) + 0.111
@@ -517,10 +528,11 @@ func proximity(rssi: Int, calibratedRSSIAt1m ref: Int?) -> Proximity {
     if let ref = ref {
         let d = estimateDistanceMeters(rssi: rssi, calibratedRSSIAt1m: ref)
         // A reference of 0 is an unusable calibration (an uncalibrated beacon shipping the
-        // default measured-power byte, or an Eddystone tx power of exactly 41), which is the
-        // one case estimateDistanceMeters answers with its -1 sentinel. That means "no usable
-        // reference", not "no idea how far away this is" — so fall through to the RSSI
-        // thresholds below rather than reporting worse than a device with no calibration.
+        // default measured-power byte, or an Eddystone tx power of exactly 41), and so is a
+        // positive one (a bad beacon value); those are what estimateDistanceMeters answers
+        // with its -1 sentinel. That means "no usable reference", not "no idea how far away
+        // this is" — so fall through to the RSSI thresholds below rather than reporting
+        // worse than a device with no calibration.
         if d >= 0 {
             if d < 0.5 { return .immediate }
             if d < 4.0 { return .near }
