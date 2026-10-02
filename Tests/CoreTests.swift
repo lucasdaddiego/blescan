@@ -156,6 +156,12 @@ let ibeaconBytes: [UInt8] =
         let tlm = parseEddystone([0x20, 0x00, 0x0B, 0xB8, 0x0B, 0x00, 0x00, 0x00, 0x04, 0xD2, 0x00, 0x00, 0x27, 0x10])
         eq(tlm, .tlm(battery: 3000, temperature: 11.0, advCount: 1234, uptimeDeciseconds: 10000), "Eddystone-TLM")
         ok(parseEddystone([0x20, 0x00]) == nil, "short TLM → nil")
+        // Encrypted TLM (version 0x01): ciphertext, never decoded as battery / temperature.
+        let etlm = parseEddystone([0x20, 0x01] + Array(repeating: 0x9C, count: 16))
+        eq(etlm, .etlm, "Eddystone-eTLM (version 0x01) is recognised, not decoded")
+        ok(etlm?.txPower == nil, "eTLM has no tx-power reference")
+        eq(etlm?.summary, "Eddystone-TLM (encrypted)", "eTLM summary shows no telemetry")
+        ok(parseEddystone([0x20, 0x02] + Array(repeating: 0, count: 12)) == nil, "unknown TLM version → nil")
 
         let eid = parseEddystone([0x30, 0xEC] + Array(repeating: 0xEE, count: 8))
         eq(eid, .eid(txPower: -20, eid: "eeeeeeeeeeeeeeee"), "Eddystone-EID")

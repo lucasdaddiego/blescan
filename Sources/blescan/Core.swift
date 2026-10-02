@@ -318,13 +318,15 @@ enum Eddystone: Equatable {
     case uid(txPower: Int, namespace: String, instance: String)
     case url(txPower: Int, url: String)
     case tlm(battery: Int, temperature: Double, advCount: UInt32, uptimeDeciseconds: UInt32)
+    /// Encrypted TLM (version 0x01, sent by EID beacons): the telemetry is ciphertext.
+    case etlm
     case eid(txPower: Int, eid: String)
 
     /// Calibrated TX power at 0 m (UID/URL/EID frames); TLM carries no ranging reference.
     var txPower: Int? {
         switch self {
         case .uid(let t, _, _), .url(let t, _), .eid(let t, _): return t
-        case .tlm: return nil
+        case .tlm, .etlm: return nil
         }
     }
 
@@ -336,6 +338,7 @@ enum Eddystone: Equatable {
         case .tlm(let batt, let temp, let cnt, let up):
             return String(format: "Eddystone-TLM %dmV %.1f°C cnt=%u up=%.0fs",
                           batt, temp, cnt, Double(up) / 10.0)
+        case .etlm:                     return "Eddystone-TLM (encrypted)"
         case .eid(_, let eid):          return "Eddystone-EID \(eid)"
         }
     }
@@ -356,6 +359,14 @@ func parseEddystone(_ d: [UInt8]) -> Eddystone? {
                     url: decodeEddystoneURL(scheme: d[2], Array(d[3...])))
     case 0x20:   // TLM: frame, version, battery(2), temp(2 8.8), advCount(4), uptime(4)
         guard d.count >= 14 else { return nil }
+        // Only version 0x00 is plain telemetry. 0x01 is encrypted TLM (12 bytes of
+        // ciphertext + salt + MIC): decoding it as plain printed invented battery and
+        // temperature readings. Any other version is a layout we don't know.
+        switch d[1] {
+        case 0x00: break
+        case 0x01: return .etlm
+        default:   return nil
+        }
         let battery = Int(UInt16(d[2]) << 8 | UInt16(d[3]))
         let tempRaw = Int16(bitPattern: UInt16(d[4]) << 8 | UInt16(d[5]))
         let count = UInt32(d[6]) << 24 | UInt32(d[7]) << 16 | UInt32(d[8]) << 8 | UInt32(d[9])
