@@ -122,7 +122,8 @@ TUI — nothing to install, and nothing between you and the raw advert bytes.
 - **macOS** (built & tested on **macOS 26 / Apple Silicon**; targets macOS 12+).
 - **Xcode 16+ Command Line Tools** for `swiftc` — `xcode-select --install`. The code is
   in Swift 6 language mode, so a Swift 6 toolchain is required to build (running the
-  binary needs only macOS 12+).
+  binary needs only macOS 12+). `swift build` reads `Package.swift` (tools-version 6.3),
+  so it needs Swift 6.3+; the Makefile path works with any Swift 6 `swiftc`.
 - A Bluetooth radio that's turned on. That's it — no Homebrew formulae, no Swift packages.
 
 > **Linux / Windows:** **N/A.** CoreBluetooth is macOS‑only; a Linux port would be an
