@@ -54,6 +54,11 @@ EMBED_PLIST := -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlink
 # Release: optimise (-O), strip local symbols (-x), drop dead code (-dead_strip).
 # No -g, so zero debug info. Stripping is at link time, before signing.
 RELEASE     := -O -Xlinker -x -Xlinker -dead_strip
+# Slices in the universal dist binary. The x86_64 slice needs a toolchain whose Swift
+# compatibility libraries carry both architectures — Xcode's does, and that is what the
+# release workflow runs on. The Command Line Tools ship them arm64-only, so on a CLT-only
+# Mac build a single-slice dist with `make dist ARCHS=arm64`.
+ARCHS       ?= arm64 x86_64
 
 .DEFAULT_GOAL := help
 .PHONY: help build install run diag test coverage dist release clean uninstall
@@ -119,29 +124,40 @@ coverage: ## Run the core tests under coverage; fail unless Core.swift is 100% c
 	@xcrun llvm-cov report "$(COV_DIR)/tests" -instr-profile="$(COV_DIR)/tests.profdata" $(CORE)
 	@bash scripts/check-coverage.sh "$(COV_DIR)/tests" "$(COV_DIR)/tests.profdata" $(CORE)
 
-# Universal binary: the two slices are cross-compiled with -target (the macOS SDK carries
-# both), lipo'd together, then signed once. Run by the release workflow on every v* tag.
-dist: ## Build a universal (arm64 + x86_64) signed blescan and zip it with LICENSE + README
+# Universal binary: each slice is cross-compiled with -target (the macOS SDK carries both),
+# the slices are lipo'd together, signed once, zipped with LICENSE + README, and a SHA-256
+# manifest is written beside the zip so a download can be checked against what CI built.
+# Run by the release workflow on every v* tag.
+dist: ## Build a universal (arm64 + x86_64) signed blescan, zip it with LICENSE + README, write SHA256SUMS
+	@rm -rf "$(DIST_DIR)"
 	@mkdir -p "$(DIST_DIR)"
-	$(SWIFTC) $(SWIFTFLAGS) $(RELEASE) $(EMBED_PLIST) -target arm64-apple-macosx12.0 $(SRC) -o "$(DIST_DIR)/blescan-arm64" $(FRAMEWORKS)
-	$(SWIFTC) $(SWIFTFLAGS) $(RELEASE) $(EMBED_PLIST) -target x86_64-apple-macosx12.0 $(SRC) -o "$(DIST_DIR)/blescan-x86_64" $(FRAMEWORKS)
-	lipo -create "$(DIST_DIR)/blescan-arm64" "$(DIST_DIR)/blescan-x86_64" -output "$(DIST_DIR)/$(BINARY)"
+	@for arch in $(ARCHS); do \
+	  echo "$(SWIFTC) $(SWIFTFLAGS) $(RELEASE) $(EMBED_PLIST) -target $$arch-apple-macosx12.0 $(SRC) -o \"$(DIST_DIR)/blescan-$$arch\" $(FRAMEWORKS)"; \
+	  $(SWIFTC) $(SWIFTFLAGS) $(RELEASE) $(EMBED_PLIST) -target $$arch-apple-macosx12.0 $(SRC) -o "$(DIST_DIR)/blescan-$$arch" $(FRAMEWORKS) || exit 1; \
+	done
+	lipo -create $(foreach a,$(ARCHS),"$(DIST_DIR)/blescan-$(a)") -output "$(DIST_DIR)/$(BINARY)"
 	codesign --force --sign $(SIGN) --identifier $(BUNDLE_ID) "$(DIST_DIR)/$(BINARY)"
-	rm -f "$(DIST_ZIP)"
 	zip -qj "$(DIST_ZIP)" "$(DIST_DIR)/$(BINARY)" LICENSE README.md
+	cd "$(DIST_DIR)" && shasum -a 256 "$(notdir $(DIST_ZIP))" > SHA256SUMS
 	@echo "built $(DIST_ZIP) ($$(du -h "$(DIST_ZIP)" | cut -f1)): $$(lipo -archs "$(DIST_DIR)/$(BINARY)")"
 
 # Tagging is the release trigger: .github/workflows/release.yml builds `make dist` on the
-# tag and publishes the zip as a GitHub release. Bump CFBundleShortVersionString first.
+# tag and publishes the zip + SHA256SUMS as a GitHub release. Bump CFBundleShortVersionString
+# first. HEAD must already be on origin/master: a tag on an unpushed commit would release
+# code nobody has reviewed on GitHub.
 release: ## Tag v$(VERSION) (from Info.plist) and push the tag — CI builds + publishes the release
 	@git diff --quiet && git diff --cached --quiet || { echo "release: commit or stash your changes first"; exit 1; }
+	@git fetch -q origin master
+	@git merge-base --is-ancestor HEAD origin/master || { echo "release: HEAD is not on origin/master — push it first"; exit 1; }
 	@! git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null || { echo "release: tag v$(VERSION) exists — bump CFBundleShortVersionString in $(PLIST)"; exit 1; }
 	git tag -a "v$(VERSION)" -m "blescan v$(VERSION)"
 	git push origin "v$(VERSION)"
 	@echo "tagged v$(VERSION) — follow the release build with: gh run watch"
 
+# _CodeSignature/ is the stale seal an older Makefile left at the repo root (it signed the
+# binary in place, and codesign treated the root as a flat bundle — see the build rule).
 clean: ## Remove local build artifacts (leaves the installed binary — see uninstall)
-	rm -rf "$(BINARY)" "$(COV_DIR)" "$(DIST_DIR)" "$(TEST_BIN)"
+	rm -rf "$(BINARY)" "$(COV_DIR)" "$(DIST_DIR)" "$(TEST_BIN)" _CodeSignature
 
 uninstall: ## Remove the installed binary from ~/.bin
 	rm -f "$(INSTALL_DIR)/$(BINARY)"

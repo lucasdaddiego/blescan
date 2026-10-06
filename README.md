@@ -138,7 +138,8 @@ make uninstall  # remove it
 ```
 
 Or grab the universal (Apple Silicon + Intel) zip from the
-[latest release](https://github.com/lucasdaddiego/blescan/releases/latest), then
+[latest release](https://github.com/lucasdaddiego/blescan/releases/latest): check it against
+the published `SHA256SUMS` (`shasum -a 256 -c SHA256SUMS`), then
 `xattr -d com.apple.quarantine blescan` (it's ad‑hoc signed, so Gatekeeper quarantines the
 download) and put it on your `PATH`. Building from source skips the quarantine step and,
 with a personal certificate, keeps the Bluetooth grant across upgrades (below).
@@ -473,7 +474,7 @@ Sources/blescan/main.swift   CoreBluetooth (Radio) · TUI · entrypoint
 Tests/CoreTests.swift        dependency-free unit tests for Core (`make test`, 100% covered)
 scripts/check-coverage.sh    coverage gate — fails unless Core.swift is 100% region+line covered
 .github/workflows/ci.yml     GitHub Actions: debug + release build, tests, coverage gate on every push/PR
-.github/workflows/release.yml GitHub Actions: on a v* tag, `make dist` → universal zip → GitHub release
+.github/workflows/release.yml GitHub Actions: on a v* tag, `make dist` → universal zip + SHA256SUMS → GitHub release
 Info.plist                   Bluetooth usage string, embedded into the binary at link time
 Makefile                     `make install` → signed blescan in ~/.bin; `make test` / `make coverage`
 Package.swift                SwiftPM manifest (for editors/tooling/CI; the Makefile uses swiftc)
@@ -492,14 +493,18 @@ make build                 # build + sign ./blescan locally, no install (quick c
 make run ARGS=--diag       # build, then run ./blescan with flags (≡ make diag)
 make test                  # run the core unit tests (no Xcode/XCTest needed — CLT only)
 make coverage              # run tests under llvm-cov; fails unless Core.swift is 100% covered
-make dist                  # universal (arm64 + x86_64) signed binary + zip in .build/dist
+make dist                  # universal (arm64 + x86_64) signed binary + zip + SHA256SUMS in .build/dist
 make release               # tag v<Info.plist version> and push it; CI builds + publishes the release
 make clean                 # remove build artifacts (make uninstall removes ~/.bin/blescan)
 ```
 
-**Releasing:** bump `CFBundleShortVersionString` in `Info.plist`, commit, `make release`.
-The tag triggers `release.yml`, which checks the tag against the plist and the binary's own
-`--version`, runs the tests, builds the universal zip and publishes it with generated notes.
+**Releasing:** bump `CFBundleShortVersionString` in `Info.plist`, commit, push, `make release`
+(it refuses a HEAD that isn't on `origin/master`). The tag triggers `release.yml`, which
+checks the tag against the plist and the binary's own `--version`, runs the tests, builds the
+universal zip and publishes it with its `SHA256SUMS` and generated notes. A manual run of the
+workflow (`gh workflow run release.yml`) is a dry run: same build and smoke test, no publish.
+The x86_64 slice needs Xcode's toolchain (the CI runner has it); a Command Line Tools-only
+Mac can still build a single-slice binary with `make dist ARCHS=arm64`.
 
 Two files: **`Core.swift`** holds the pure, framework‑free logic (fingerprinting, the
 advert merge rules, the rate meter, proximity, colour, sorting, hex dump, text layout,
