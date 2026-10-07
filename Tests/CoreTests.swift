@@ -812,6 +812,18 @@ let ibeaconBytes: [UInt8] =
         ok(dev(mfg: ibeaconBytes).beaconKey == "ibeacon:01010101-0101-0101-0101-010101010101/42/7", "iBeacon key")
         ok(dev().beaconKey == nil, "plain device has no beacon key")
         eq(dev(name: "").displayName, "(unnamed)", "empty name placeholder")
+        eq(nameForDisplay(nil), "(unnamed)", "nameForDisplay: nil → placeholder")
+        eq(nameForDisplay("Buds"), "Buds", "nameForDisplay: a name passes through")
+        // Lowercase caches for the name sort and the filter, rebuilt with the fingerprint —
+        // sorting 300 devices by name used to lowercase both names on every comparison.
+        var cached = dev(name: "Bose QC", mfg: [0x9E, 0x00], svc: ["1812"])
+        eq(cached.displayNameLower, "bose qc", "display name cached lowercase")
+        eq(cached.vendorLower, "bose", "vendor cached lowercase")
+        eq(cached.typeLower, "keyboard / mouse (hid)", "type cached lowercase")
+        eq(dev(name: nil).displayNameLower, "(unnamed)", "placeholder cached for an unnamed device")
+        cached.absorb(dev(name: "Tile Pro", mfg: [0x7C, 0x06]), at: 1)
+        eq(cached.displayNameLower, "tile pro", "a new name refreshes the cache")
+        eq(cached.vendorLower, "tile", "…and the vendor")
         ok(dev(name: "x").isNamed, "isNamed true when named")
         ok(!dev(name: nil).isNamed, "isNamed false when unnamed")
         ok(dev(rssi: -60).hasValidRSSI, "valid rssi")

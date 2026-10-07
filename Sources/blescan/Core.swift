@@ -49,6 +49,14 @@ struct Fingerprint {
     let advertisedServices: [String]
     /// Best-guess device category from services + manufacturer signature.
     let typeLabel: String
+    /// Lowercased display name, vendor and type for the case-insensitive name sort and the
+    /// `/` filter. Cached here — the fingerprint is rebuilt whenever any of its inputs
+    /// change — because `--sort name` lowercased both names on EVERY comparison and the
+    /// filter lowercased three strings per device, every frame: 300 devices sorted by name
+    /// cost thousands of String allocations per frame at 10 fps.
+    let displayNameLower: String
+    let vendorLower: String
+    let typeLower: String
     /// Calibrated RSSI at 1 m for ranging, when the advertisement provides a reference:
     /// iBeacon carries a 1 m measured-power byte directly; Eddystone carries a 0 m TX
     /// power, which the spec says to offset by ~41 dB to estimate the 1 m value. The bare
@@ -71,6 +79,9 @@ struct Fingerprint {
         typeLabel = inferDeviceType(serviceShortUUIDs: serviceShortSet, companyId: companyId,
                                     iBeacon: iBeacon != nil, eddystone: eddystone != nil,
                                     continuityTypes: continuitySeen, name: name)
+        displayNameLower = nameForDisplay(name).lowercased()
+        vendorLower = vendor.lowercased()
+        typeLower = typeLabel.lowercased()
         if let b = iBeacon { calibratedRSSIAt1m = b.measuredPower }
         else if let e = eddystone, let tx = e.txPower { calibratedRSSIAt1m = tx - 41 }
         else { calibratedRSSIAt1m = nil }
@@ -159,6 +170,9 @@ struct Device {
     var typeLabel: String { fingerprint.typeLabel }
     var calibratedRSSIAt1m: Int? { fingerprint.calibratedRSSIAt1m }
     var beaconKey: String? { fingerprint.beaconKey }
+    var displayNameLower: String { fingerprint.displayNameLower }
+    var vendorLower: String { fingerprint.vendorLower }
+    var typeLower: String { fingerprint.typeLower }
 
     /// Proximity bucket (immediate / near / far / unknown) from RSSI + any 1 m reference.
     var proximityBucket: Proximity { proximity(rssi: rssi, calibratedRSSIAt1m: calibratedRSSIAt1m) }
@@ -170,13 +184,17 @@ struct Device {
     func seenFor(now: Double) -> Double { max(0, now - firstSeen) }
 
     /// Name for display — the advertised name, or a dim placeholder when unnamed.
-    var displayName: String {
-        if let n = name, !n.isEmpty { return n }
-        return "(unnamed)"
-    }
+    var displayName: String { nameForDisplay(name) }
 
     var isNamed: Bool { name?.isEmpty == false }
     var hasValidRSSI: Bool { rssi < 0 && rssi > -127 }
+}
+
+/// The advertised name as the table shows it, or the placeholder when there is none. One
+/// rule, shared by `Device.displayName` and the fingerprint's lowercase cache.
+func nameForDisplay(_ name: String?) -> String {
+    if let n = name, !n.isEmpty { return n }
+    return "(unnamed)"
 }
 
 // MARK: - Manufacturer data
@@ -596,7 +614,7 @@ func deviceBefore(_ a: Device, _ b: Device, by key: SortKey) -> Bool {
         return rssiThenID(a, b)
     case .name:
         if a.isNamed != b.isNamed { return a.isNamed }   // named first
-        let an = a.displayName.lowercased(), bn = b.displayName.lowercased()
+        let an = a.displayNameLower, bn = b.displayNameLower   // cached: no lowercasing per comparison
         return an != bn ? an < bn : rssiThenID(a, b)
     case .vendor:
         return a.vendor != b.vendor ? a.vendor < b.vendor : rssiThenID(a, b)
@@ -1148,10 +1166,8 @@ func applyView(_ devices: [Device], filter: String, connectableOnly: Bool, named
     if namedOnly { f = f.filter { $0.isNamed } }
     if !filter.isEmpty {
         let q = filter.lowercased()
-        f = f.filter {
-            $0.displayName.lowercased().contains(q) || $0.vendor.lowercased().contains(q)
-                || $0.typeLabel.lowercased().contains(q)
-        }
+        // The lowercase forms are cached on the fingerprint: no allocations per device per frame.
+        f = f.filter { $0.displayNameLower.contains(q) || $0.vendorLower.contains(q) || $0.typeLower.contains(q) }
     }
     return sortDevices(f, by: sort, ascending: ascending)
 }
