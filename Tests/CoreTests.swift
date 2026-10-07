@@ -61,7 +61,11 @@ let ibeaconBytes: [UInt8] =
         testFittingVariant()
         testSanitize()
         testKeyInput()
+        testCSI()
+        testAnsi()
+        testClipAnsi()
         testHeadlessOutcome()
+        testDeviceJSON()
         testDevice()
         testAbsorb()
         testAdvertRate()
@@ -542,6 +546,70 @@ let ibeaconBytes: [UInt8] =
         eq(displayWidth("filter: " + "café"), 12, "accented filter text is one column per letter")
     }
 
+    // MARK: CSI / SGR input decoding
+
+    static func testCSI() {
+        ok(isCSIFinal(0x40) && isCSIFinal(0x4D) && isCSIFinal(0x7E), "final bytes 0x40–0x7E end a sequence")
+        ok(!isCSIFinal(0x3B) && !isCSIFinal(0x3C) && !isCSIFinal(0x7F), "digits, ';' and '<' do not")
+        func bytes(_ s: String) -> [UInt8] { Array(s.utf8) }
+        eq(decodeCSI(bytes("<0;10;5M")), .mouse(MouseEvent(button: 0, col: 10, row: 5, press: true)), "SGR press")
+        eq(decodeCSI(bytes("<65;3;22m")), .mouse(MouseEvent(button: 65, col: 3, row: 22, press: false)), "SGR release (wheel down)")
+        eq(decodeCSI(bytes("<0;10M")), .none, "a mouse report with two numbers is dropped")
+        eq(decodeCSI(bytes("<0;x;5M")), .none, "a non-numeric field is dropped")
+        eq(decodeCSI(bytes("<0;10;5~")), .none, "a '<' body with a non-mouse final is dropped")
+        eq(decodeCSI([0x41]), .up, "ESC [ A → up")
+        eq(decodeCSI([0x42]), .down, "ESC [ B → down")
+        eq(decodeCSI([0x43]), .none, "right arrow is ignored")
+        eq(decodeCSI(bytes("5~")), .none, "PgUp is ignored")
+        eq(decodeCSI([]), .none, "empty body → nothing")
+        ok(Input.key("q") == .key("q") && Input.key("q") != .key("j"), "inputs compare by value")
+    }
+
+    // MARK: ANSI styling & clipping
+
+    static func testAnsi() {
+        Ansi.enabled = true
+        eq(Ansi.wrap("x", "1"), "\u{1B}[1mx\u{1B}[0m", "wrap emits SGR + reset")
+        eq(Ansi.bold("x"), "\u{1B}[1mx\u{1B}[0m", "bold")
+        eq(Ansi.dim("x"), "\u{1B}[2mx\u{1B}[0m", "dim")
+        eq(Ansi.fg256("x", 46), "\u{1B}[38;5;46mx\u{1B}[0m", "fg256")
+        eq(Ansi.bg256("x", 25), "\u{1B}[48;5;25mx\u{1B}[0m", "bg256")
+        eq(Ansi.fgRGB("x", (1, 2, 3)), "\u{1B}[38;2;1;2;3mx\u{1B}[0m", "fgRGB")
+        // A row is many coloured cells, each ending in a reset; the highlight must survive
+        // every one of them, not just reach the first.
+        let row = Ansi.fg256("a", 1) + " " + Ansi.dim("b")
+        let hi = Ansi.bg256Persistent(row, 236)
+        eq(hi.components(separatedBy: "\u{1B}[48;5;236m").count - 1, 3, "background re-asserted after each interior reset")
+        ok(hi.hasPrefix("\u{1B}[48;5;236m") && hi.hasSuffix("\u{1B}[0m"), "highlight opens with the bg and closes with a reset")
+        Ansi.enabled = false
+        eq(Ansi.wrap("x", "1"), "x", "disabled: wrap is the identity")
+        eq(Ansi.bold("x") + Ansi.fg256("y", 1) + Ansi.fgRGB("z", (1, 1, 1)), "xyz", "disabled: no escapes at all")
+        eq(Ansi.bg256Persistent("a\u{1B}[0mb", 236), "a\u{1B}[0mb", "disabled: highlight is the identity")
+        Ansi.enabled = true
+    }
+
+    static func testClipAnsi() {
+        Ansi.enabled = true
+        eq(clipAnsi("abc", 0), "", "zero columns → empty")
+        eq(clipAnsi("abc", 5), "abc", "fits → unchanged, no reset appended")
+        eq(clipAnsi("abcdef", 3), "abc\u{1B}[0m", "truncated → reset appended so colour can't bleed")
+        // Escapes are copied whole and cost no columns.
+        let red = "\u{1B}[31mabcdef\u{1B}[0m"
+        eq(clipAnsi(red, 10), red, "escapes cost nothing: the whole string fits")
+        eq(clipAnsi(red, 2), "\u{1B}[31mab\u{1B}[0m", "escape kept, text clipped, reset appended")
+        eq(clipAnsi("a你b", 2), "a\u{1B}[0m", "a wide glyph that would straddle the edge is dropped")
+        eq(clipAnsi("ab\u{1B}[", 5), "ab\u{1B}[", "an unterminated escape at the end is copied as-is")
+        // padToWidth stretches short content (the selected-row highlight) — never past cols,
+        // and never a truncated row.
+        eq(clipAnsi("ab", 10, padToWidth: 5), "ab   ", "padded to the requested width")
+        eq(clipAnsi("ab", 3, padToWidth: 5), "ab ", "padding is capped at cols")
+        eq(clipAnsi("abcdef", 3, padToWidth: 10), "abc\u{1B}[0m", "a truncated row is not padded")
+        eq(clipAnsi("abcde", 10, padToWidth: 3), "abcde", "already wider than the pad target → untouched")
+        Ansi.enabled = false
+        eq(clipAnsi("abcdef", 3), "abc", "colour off: truncation appends no reset")
+        Ansi.enabled = true
+    }
+
     static func testSanitize() {
         eq(sanitizeName("AirPods Pro"), "AirPods Pro", "printable name unchanged")
         eq(sanitizeName(""), "", "empty stays empty")
@@ -600,6 +668,74 @@ let ibeaconBytes: [UInt8] =
            "exit statuses: 1 runtime · 2 usage · 3 no scan · 4 adapter lost")
         ok(Set([ExitStatus.runtime, ExitStatus.usage, ExitStatus.noScan, ExitStatus.adapterLost]).count == 4,
            "every outcome has a distinct exit status")
+    }
+
+    // MARK: JSON output (--json array element / --stream line)
+
+    /// Encode one device the way --json / --stream do and decode it back to a dictionary.
+    static func jsonObject(_ d: Device, now t: Double = 100, ts: String? = nil) -> [String: Any] {
+        let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
+        let data = try! enc.encode(DeviceJSON(d, now: t, ts: ts))
+        return try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+    }
+
+    static func testDeviceJSON() {
+        // A plain named device: the always-present fields, and every optional that has a value.
+        let plain = jsonObject(dev(id: "ID1", name: "Sensor", rssi: -50, tx: 4, conn: true, mfg: [0x59, 0x00],
+                                   svc: ["180F"], solicited: ["1811"], overflow: ["1812"], first: 40, last: 99, rate: 2.46))
+        eq(plain["id"] as? String, "ID1", "id")
+        eq(plain["name"] as? String, "Sensor", "name")
+        eq(plain["rssi"] as? Int, -50, "rssi")
+        eq(plain["txPower"] as? Int, 4, "txPower")
+        eq(plain["connectable"] as? Bool, true, "connectable")
+        eq(plain["vendor"] as? String, "Nordic Semiconductor", "vendor")
+        eq(plain["companyId"] as? String, "0x0059", "companyId as 0xXXXX")
+        eq(plain["type"] as? String, "Keyboard / mouse (HID)", "type (the overflow 1812 counts)")
+        eq(plain["manufacturerHex"] as? String, "5900", "manufacturer bytes as hex")
+        eq(plain["proximity"] as? String, "immediate", "proximity")
+        eq(plain["advertsPerSecond"] as? Double, 2.5, "advert rate rounded to one decimal")
+        eq(plain["firstSeenSecondsAgo"] as? Int, 60, "firstSeenSecondsAgo")
+        eq(plain["lastSeenSecondsAgo"] as? Int, 1, "lastSeenSecondsAgo")
+        eq(plain["services"] as? [String], ["180F"], "services are raw normalised UUIDs")
+        eq(plain["serviceNames"] as? [String], ["Battery (0x180F)"], "serviceNames beside them")
+        eq(plain["solicitedServices"] as? [String], ["1811"], "solicited")
+        eq(plain["overflowServices"] as? [String], ["1812"], "overflow")
+        for absent in ["ts", "beaconKey", "previousId", "continuity", "iBeacon", "eddystone", "serviceData"] {
+            ok(plain[absent] == nil, "\(absent) omitted when not advertised")
+        }
+
+        // An unnamed device with the RSSI sentinel: name and rssi are omitted, not nulled.
+        let bare = jsonObject(dev(id: "ID2", name: nil, rssi: 127))
+        ok(bare["name"] == nil && bare["rssi"] == nil, "unnamed + unavailable RSSI → fields omitted")
+        ok(bare["companyId"] == nil && bare["txPower"] == nil && bare["connectable"] == nil,
+           "no manufacturer data / tx / connectable → omitted")
+        ok(bare["manufacturerHex"] == nil, "no manufacturer data → manufacturerHex omitted")
+        eq(bare["vendor"] as? String, "—", "vendor dash")
+        eq(bare["proximity"] as? String, "—", "proximity unknown")
+
+        // A beacon: structured iBeacon, the Apple continuity list, manufacturer hex, the
+        // beacon key, service data (an empty entry is dropped), and a stream timestamp.
+        var beacon = dev(id: "B", mfg: ibeaconBytes,
+                         svcData: [ServiceDatum(uuid: "FEAA", bytes: [0x10, 0xEC, 0x02, 0x67, 0x6F, 0x07]),
+                                   ServiceDatum(uuid: "180F", bytes: [])])
+        beacon.previousID = "OLD"
+        let b = jsonObject(beacon, ts: "2026-10-06T20:00:00.000Z")
+        eq(b["ts"] as? String, "2026-10-06T20:00:00.000Z", "ts carried when given")
+        let ib = b["iBeacon"] as? [String: Any]
+        eq(ib?["uuid"] as? String, "01010101-0101-0101-0101-010101010101", "iBeacon uuid")
+        eq(ib?["major"] as? Int, 42, "iBeacon major")
+        eq(ib?["minor"] as? Int, 7, "iBeacon minor")
+        eq(ib?["measuredPower"] as? Int, -59, "iBeacon measured power")
+        eq(b["beaconKey"] as? String, "ibeacon:01010101-0101-0101-0101-010101010101/42/7", "beacon key")
+        eq(b["previousId"] as? String, "OLD", "previous id after a rotation")
+        eq(b["continuity"] as? [String], ["iBeacon"], "continuity names")
+        eq(b["manufacturerHex"] as? String, hexString(ibeaconBytes), "manufacturer bytes as hex")
+        eq(b["eddystone"] as? String, "Eddystone-URL http://go.com", "eddystone summary")
+        let sd = b["serviceData"] as? [[String: Any]]
+        eq(sd?.count, 1, "empty service-data entries are dropped")
+        eq(sd?.first?["service"] as? String, "FEAA", "service-data uuid")
+        eq(sd?.first?["serviceName"] as? String, "Google Eddystone (0xFEAA)", "service-data name")
+        eq(sd?.first?["hex"] as? String, "10ec02676f07", "service-data hex")
     }
 
     // MARK: Device computed properties

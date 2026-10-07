@@ -731,6 +731,70 @@ func signalFraction(_ rssi: Int) -> Double {
     max(0.0, min(1.0, Double(rssi + 100) / 60.0))
 }
 
+// MARK: - ANSI styling & clipping
+//
+// The SGR wrappers and the escape-aware clipper: pure string work, so it lives under the
+// coverage gate. The terminal-capability half (truecolor gradients, signal bars) is an
+// extension in main.swift, because it reads the environment.
+
+enum Ansi {
+    /// Set once in main() before anything renders, read everywhere after — hence the
+    /// `nonisolated(unsafe)`: there is no concurrent writer to guard against.
+    nonisolated(unsafe) static var enabled = true
+    static func wrap(_ s: String, _ code: String) -> String {
+        enabled ? "\u{1B}[\(code)m\(s)\u{1B}[0m" : s
+    }
+    static func bold(_ s: String) -> String { wrap(s, "1") }
+    static func dim(_ s: String) -> String { wrap(s, "2") }
+    static func fg256(_ s: String, _ c: Int) -> String { wrap(s, "38;5;\(c)") }
+    static func bg256(_ s: String, _ c: Int) -> String { wrap(s, "48;5;\(c)") }
+    static func fgRGB(_ s: String, _ c: RGB) -> String { wrap(s, "38;2;\(c.r);\(c.g);\(c.b)") }
+
+    /// Apply a 256-colour background that survives a string already peppered with `ESC[0m`
+    /// resets (each cell colours itself and resets). A plain bg256 wrap would be cancelled
+    /// by the first interior reset, leaving only the first cell highlighted — so re-assert
+    /// the background after every reset. Used for the selected-row highlight.
+    static func bg256Persistent(_ s: String, _ c: Int) -> String {
+        guard enabled else { return s }
+        let set = "\u{1B}[48;5;\(c)m"
+        return set + s.replacingOccurrences(of: "\u{1B}[0m", with: "\u{1B}[0m" + set) + "\u{1B}[0m"
+    }
+}
+
+/// Clip a possibly-ANSI-coloured string to `cols` visible cells, copying escape
+/// sequences verbatim and re-appending a reset if truncated (so colour can't bleed past
+/// the cut). When `padToWidth` is given and the (untruncated) content is shorter, pad with
+/// spaces to that many visible cells — used to stretch the selected-row highlight to the
+/// full row width.
+func clipAnsi(_ s: String, _ cols: Int, padToWidth: Int? = nil) -> String {
+    if cols <= 0 { return "" }
+    var out = "", width = 0, truncated = false
+    var i = s.startIndex
+    while i < s.endIndex {
+        let c = s[i]
+        if c == "\u{1B}" {
+            out.append(c)
+            var j = s.index(after: i)
+            while j < s.endIndex {
+                let e = s[j]; out.append(e); j = s.index(after: j)
+                if e.isLetter { break }
+            }
+            i = j
+            continue
+        }
+        let cw = charDisplayWidth(c)
+        if width + cw > cols { truncated = true; break }
+        out.append(c); width += cw
+        i = s.index(after: i)
+    }
+    if truncated && Ansi.enabled { out += "\u{1B}[0m" }
+    if let p = padToWidth, !truncated {
+        let target = min(p, cols)
+        if width < target { out += String(repeating: " ", count: target - width) }
+    }
+    return out
+}
+
 // MARK: - Sub-cell bars (Unicode eighth-blocks) & sparklines
 
 private let eighthBlocks = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
@@ -959,6 +1023,39 @@ func decodeKey(_ bytes: [UInt8]) -> Character? {
     return c
 }
 
+// MARK: - Keyboard input (escape sequences)
+
+/// A decoded SGR-1006 mouse report. `col`/`row` are 1-based screen cells.
+struct MouseEvent: Equatable { let button: Int; let col: Int; let row: Int; let press: Bool }
+
+/// One unit of input: a key, a mouse report, an arrow, or nothing this tick.
+enum Input: Equatable { case key(Character), mouse(MouseEvent), up, down, none }
+
+/// True for the byte that ends a CSI sequence (`ESC [ … final`, final in 0x40–0x7E). The
+/// reader drains up to it — the WHOLE sequence, not a fixed byte count — so a mouse
+/// report's digits can never leak out as stray single-key commands.
+func isCSIFinal(_ b: UInt8) -> Bool { (0x40...0x7E).contains(b) }
+
+/// Decode the body of a CSI / SS3 sequence (everything after `ESC [` or `ESC O`, final
+/// byte included): an SGR mouse report `< b ; x ; y` + `M` (press) / `m` (release), or an
+/// arrow key (`A` up, `B` down) as a dedicated event — NOT a synthesized j/k character,
+/// which would be typed into the filter while it is being edited. Anything else is dropped.
+func decodeCSI(_ body: [UInt8]) -> Input {
+    if let first = body.first, first == 0x3C /* < */, let final = body.last, final == 0x4D || final == 0x6D {
+        let nums = String(decoding: body.dropFirst().dropLast(), as: UTF8.self)
+            .split(separator: ";").compactMap { Int($0) }
+        if nums.count == 3 {
+            return .mouse(MouseEvent(button: nums[0], col: nums[1], row: nums[2], press: final == 0x4D))
+        }
+        return .none
+    }
+    switch body.last {
+    case 0x41: return .up
+    case 0x42: return .down
+    default:   return .none
+    }
+}
+
 // MARK: - Command line
 
 enum Mode: Equatable { case tui, once, json, stream, diag, help, version }
@@ -1086,6 +1183,72 @@ enum ExitStatus {
 /// minutes of output with "no scan performed" and exit 3 was wrong on both counts.
 func streamInterrupted(state: String, afterSeconds seconds: Double) -> String {
     "blescan: adapter went \(state) after \(Int(seconds.rounded())) s — stream ended"
+}
+
+// MARK: - JSON output (--json array element / --stream line)
+
+/// One device as JSON. Optional fields are omitted when absent (synthesized Encodable uses
+/// encodeIfPresent), so the output only carries what a device actually advertised.
+/// Services are raw normalised UUIDs so a consumer can match on them
+/// (`select(.services | index("180D"))`); the display strings live beside them in
+/// `serviceNames`.
+struct DeviceJSON: Encodable {
+    struct Beacon: Encodable { let uuid: String; let major: Int; let minor: Int; let measuredPower: Int }
+    struct ServiceData: Encodable { let service: String; let serviceName: String; let hex: String }
+
+    let ts: String?                  // --stream only: wall-clock time of the line
+    let id: String
+    let name: String?
+    let rssi: Int?
+    let txPower: Int?
+    let connectable: Bool?
+    let vendor: String
+    let companyId: String?
+    let type: String
+    let proximity: String
+    let advertsPerSecond: Double
+    let firstSeenSecondsAgo: Int
+    let lastSeenSecondsAgo: Int
+    let beaconKey: String?           // stable across random-address rotation (iBeacon / Eddystone UID+URL)
+    let previousId: String?          // the id this beacon was heard under before its address rotated
+    let services: [String]
+    let serviceNames: [String]
+    let solicitedServices: [String]?
+    let overflowServices: [String]?
+    let continuity: [String]?
+    let iBeacon: Beacon?
+    let eddystone: String?
+    let manufacturerHex: String?
+    let serviceData: [ServiceData]?
+
+    init(_ d: Device, now t: Double, ts: String? = nil) {
+        func nilIfEmpty<T>(_ a: [T]) -> [T]? { a.isEmpty ? nil : a }
+        self.ts = ts
+        id = d.id
+        name = d.name
+        rssi = d.hasValidRSSI ? d.rssi : nil          // 127 == unavailable → omit
+        txPower = d.txPower
+        connectable = d.connectable
+        vendor = d.vendor
+        companyId = d.companyId.map { String(format: "0x%04X", $0) }
+        type = d.typeLabel
+        proximity = d.proximityBucket.label
+        advertsPerSecond = (d.advertsPerSecond * 10).rounded() / 10
+        firstSeenSecondsAgo = Int(d.seenFor(now: t).rounded())
+        lastSeenSecondsAgo = Int(d.age(now: t).rounded())
+        beaconKey = d.beaconKey
+        previousId = d.previousID
+        services = d.advertisedServices
+        serviceNames = d.advertisedServices.map(friendlyService)
+        solicitedServices = nilIfEmpty(d.solicitedUUIDs)
+        overflowServices = nilIfEmpty(d.overflowUUIDs)
+        continuity = nilIfEmpty(d.continuityTypes.compactMap(continuityName))
+        iBeacon = d.iBeacon.map { Beacon(uuid: $0.uuid, major: Int($0.major), minor: Int($0.minor), measuredPower: $0.measuredPower) }
+        eddystone = d.eddystone?.summary
+        manufacturerHex = d.manufacturerData.isEmpty ? nil : hexString(d.manufacturerData)
+        serviceData = nilIfEmpty(d.serviceData.filter { !$0.bytes.isEmpty }
+            .map { ServiceData(service: $0.uuid, serviceName: friendlyService($0.uuid), hex: hexString($0.bytes)) })
+    }
 }
 
 // MARK: - Bluetooth SIG assigned numbers (curated subsets)
