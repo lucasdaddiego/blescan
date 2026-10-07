@@ -990,7 +990,9 @@ func runOnce(app: App, window: TimeInterval, json: Bool) {
     let t = now()   // after the scan, so the ages are measured from the moment of output
     if json {
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let arr = devices.map { DeviceJSON($0, now: t) }
+        let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let ts = iso.string(from: Date())   // one stamp for the whole array: it is one snapshot
+        let arr = devices.map { DeviceJSON($0, now: t, ts: ts, version: blescanVersion) }
         if let data = try? enc.encode(arr), let s = String(data: data, encoding: .utf8) { print(s) } else { print("[]") }
         failIfNeverScanned(app)
         return
@@ -1007,7 +1009,8 @@ func runOnce(app: App, window: TimeInterval, json: Bool) {
 /// `--stream`: NDJSON on stdout for as long as the process runs (or `window` seconds). One
 /// line per device per packet, throttled to at most one line per device per second so a
 /// chatty beacon (allow-duplicates delivers every packet, tens a second) can't flood the
-/// pipe; a silent device produces nothing. Each line is the `--json` object plus `ts`.
+/// pipe; a silent device produces nothing. Each line is the `--json` object, stamped with
+/// its own `ts`.
 ///
 /// Two ways the adapter can be off, two exit statuses: never powered on → 3 ("no scan
 /// performed", like --json); powered on and then lost (Bluetooth switched off at minute
@@ -1038,7 +1041,7 @@ func runStream(app: App, window: TimeInterval?) {
         app.prune(at: t, drop: 60)
         let live = app.snapshotDevices(at: t)
         for d in app.visible(live) where d.lastSeen > (writtenSeen[d.id] ?? -1) && t - (writtenAt[d.id] ?? -1) >= 1 {
-            let row = DeviceJSON(d, now: t, ts: iso.string(from: Date()))
+            let row = DeviceJSON(d, now: t, ts: iso.string(from: Date()), version: blescanVersion)
             if let data = try? enc.encode(row), let s = String(data: data, encoding: .utf8) { print(s) }
             writtenAt[d.id] = t; writtenSeen[d.id] = d.lastSeen
         }

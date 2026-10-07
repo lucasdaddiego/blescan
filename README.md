@@ -330,10 +330,14 @@ omitted — beacons add structured `iBeacon` / `eddystone` fields, `serviceData`
 raw hex of each service‑data entry, `companyId` is the raw `0xXXXX`, and `rssi` is dropped
 when the radio reports it unavailable. **`services` are raw normalised UUIDs** (the SIG
 short form, `180F`, or the full 128‑bit form) so a consumer can match on them; the display
-strings sit beside them in `serviceNames`. If the adapter never reaches `poweredOn`
-(Bluetooth off, permission denied, no BLE support) the array is still printed, but a
-one‑line reason goes to stderr and the exit status is **3** — so a script never mistakes
-"the radio was off" for "nobody was advertising":
+strings sit beside them in `serviceNames`. **`name` is sanitized** the way the table is
+(C0 / C1 / Cf characters become `·` — `JSONEncoder` escapes C0 but not C1 or Cf, so a
+hostile name could otherwise reach your terminal through `jq -r`); the bytes as advertised
+are in **`nameHex`**. Every object carries **`ts`** (when it was written, ISO 8601) and
+**`version`** (the blescan that wrote it), so a saved capture explains itself. If the
+adapter never reaches `poweredOn` (Bluetooth off, permission denied, no BLE support) the
+array is still printed, but a one‑line reason goes to stderr and the exit status is **3**
+— so a script never mistakes "the radio was off" for "nobody was advertising":
 
 ```jsonc
 [
@@ -348,14 +352,17 @@ one‑line reason goes to stderr and the exit status is **3** — so a script ne
     "lastSeenSecondsAgo": 0,
     "manufacturerHex": "4c000719...",
     "name": "Lucas’ AirPods",
+    "nameHex": "4c75636173e2809920416972506f6473",
     "previousId": "0E2B9C44-…",          // only after an address rotation was linked
     "proximity": "immediate",
     "rssi": -41,
     "serviceNames": ["Battery (0x180F)"],
     "services": ["180F"],
+    "ts": "2026-10-06T20:00:00.000Z",
     "txPower": 12,
     "type": "AirPods / Apple audio",
-    "vendor": "Apple"
+    "vendor": "Apple",
+    "version": "1.2"
   }
 ]
 ```
@@ -383,8 +390,8 @@ blescan --json --named --sort name --filter garmin
 `blescan --stream` emits the same object as **NDJSON** — one compact JSON document per
 line, flushed as it's written — for every packet heard, throttled to **at most one line
 per device per second** (allow‑duplicates delivers tens of packets a second from a chatty
-beacon; the throttle keeps the pipe readable). Each line adds `ts`, the wall‑clock time
-it was written. It runs until killed, or until `--window N` seconds elapse:
+beacon; the throttle keeps the pipe readable). Each line carries its own `ts`, the
+wall‑clock time it was written. It runs until killed, or until `--window N` seconds elapse:
 
 ```sh
 blescan --stream | jq -c 'select(.type == "Find My / AirTag") | {ts, id, rssi}'
@@ -474,7 +481,7 @@ ad‑hoc signature changes every build, the grant resets on each `make install`;
 ## Project layout
 
 ```
-Sources/blescan/Core.swift   pure logic — fingerprinting · merge · rate · proximity · colour · sorting · layout · argv
+Sources/blescan/Core.swift   pure logic — fingerprinting · merge · rate · proximity · colour · sorting · layout · ANSI · input · JSON · argv
 Sources/blescan/main.swift   CoreBluetooth (Radio) · TUI · entrypoint
 Tests/CoreTests.swift        dependency-free unit tests for Core (`make test`, 100% covered)
 scripts/check-coverage.sh    coverage gate — fails unless Core.swift is 100% region+line covered
@@ -513,9 +520,10 @@ Mac can still build a single-slice binary with `make dist ARCHS=arm64`.
 
 Two files: **`Core.swift`** holds the pure, framework‑free logic (fingerprinting, the
 advert merge rules, the rate meter, proximity, colour, sorting, hex dump, text layout,
-command‑line parsing, and terminal‑escape sanitization of hostile device names) and is
-unit‑tested standalone via `make test`; **`main.swift`** holds the `Radio` (CoreBluetooth
-wrapper), the raw‑mode TUI and the headless modes.
+ANSI styling and clipping, escape‑sequence decoding, the JSON objects, command‑line
+parsing, and terminal‑escape sanitization of hostile device names) and is unit‑tested
+standalone via `make test`; **`main.swift`** holds the `Radio` (CoreBluetooth wrapper), the
+raw‑mode TUI and the headless modes.
 
 `Core.swift` is held at **100% region + line coverage** — `make coverage` (and CI, on
 every push/PR) re‑runs the tests under `llvm-cov` and `scripts/check-coverage.sh` fails

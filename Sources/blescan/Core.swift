@@ -964,8 +964,9 @@ func widthFittingVariant(_ variants: [String], _ n: Int) -> String {
 // A BLE local name is arbitrary bytes — a hostile device can name itself with ANSI escape
 // sequences, carriage returns, etc. Printing such a name raw would let it move the cursor,
 // recolour or clear the terminal, or corrupt the table. So every name passes through
-// sanitizeName before it reaches the screen. (JSON output keeps the raw name: JSONEncoder
-// escapes control bytes, so the JSON stays valid and inert until a consumer renders it.)
+// sanitizeName before it reaches the screen — and before it reaches the JSON `name` too:
+// JSONEncoder escapes C0 but not C1 or Cf, so `jq -r` would hand an 8-bit CSI straight to
+// the terminal. The bytes as advertised stay available in the JSON `nameHex`.
 
 /// Replace anything that can move the cursor, recolour/clear the terminal, OR visually
 /// reorder/hide text with a visible middle-dot placeholder: C0 controls (incl. ESC, CR,
@@ -1191,14 +1192,20 @@ func streamInterrupted(state: String, afterSeconds seconds: Double) -> String {
 /// encodeIfPresent), so the output only carries what a device actually advertised.
 /// Services are raw normalised UUIDs so a consumer can match on them
 /// (`select(.services | index("180D"))`); the display strings live beside them in
-/// `serviceNames`.
+/// `serviceNames`. `name` is sanitized exactly like the table: JSONEncoder escapes C0 but
+/// not C1 or Cf, so a name carrying U+009B (an 8-bit CSI) came out of
+/// `blescan --json | jq -r '.[].name'` as a live escape sequence. The bytes as advertised
+/// are in `nameHex`. Every object carries `ts` (when it was written) and `version` (the
+/// blescan that wrote it) in both modes, so a capture file explains itself.
 struct DeviceJSON: Encodable {
     struct Beacon: Encodable { let uuid: String; let major: Int; let minor: Int; let measuredPower: Int }
     struct ServiceData: Encodable { let service: String; let serviceName: String; let hex: String }
 
-    let ts: String?                  // --stream only: wall-clock time of the line
+    let ts: String                   // wall-clock time this object was written (ISO 8601)
+    let version: String              // the blescan that wrote it
     let id: String
-    let name: String?
+    let name: String?                // the advertised name, sanitized (C0 / C1 / Cf → ·)
+    let nameHex: String?             // the advertised name's raw UTF-8 bytes, hex
     let rssi: Int?
     let txPower: Int?
     let connectable: Bool?
@@ -1221,11 +1228,13 @@ struct DeviceJSON: Encodable {
     let manufacturerHex: String?
     let serviceData: [ServiceData]?
 
-    init(_ d: Device, now t: Double, ts: String? = nil) {
+    init(_ d: Device, now t: Double, ts: String, version: String) {
         func nilIfEmpty<T>(_ a: [T]) -> [T]? { a.isEmpty ? nil : a }
         self.ts = ts
+        self.version = version
         id = d.id
-        name = d.name
+        name = d.name.map(sanitizeName)
+        nameHex = d.name.map { hexString(Array($0.utf8)) }
         rssi = d.hasValidRSSI ? d.rssi : nil          // 127 == unavailable → omit
         txPower = d.txPower
         connectable = d.connectable

@@ -673,9 +673,10 @@ let ibeaconBytes: [UInt8] =
     // MARK: JSON output (--json array element / --stream line)
 
     /// Encode one device the way --json / --stream do and decode it back to a dictionary.
-    static func jsonObject(_ d: Device, now t: Double = 100, ts: String? = nil) -> [String: Any] {
+    static func jsonObject(_ d: Device, now t: Double = 100, ts: String = "2026-10-06T20:00:00.000Z",
+                           version: String = "9.9") -> [String: Any] {
         let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
-        let data = try! enc.encode(DeviceJSON(d, now: t, ts: ts))
+        let data = try! enc.encode(DeviceJSON(d, now: t, ts: ts, version: version))
         return try! JSONSerialization.jsonObject(with: data) as! [String: Any]
     }
 
@@ -685,6 +686,9 @@ let ibeaconBytes: [UInt8] =
                                    svc: ["180F"], solicited: ["1811"], overflow: ["1812"], first: 40, last: 99, rate: 2.46))
         eq(plain["id"] as? String, "ID1", "id")
         eq(plain["name"] as? String, "Sensor", "name")
+        eq(plain["nameHex"] as? String, "53656e736f72", "nameHex is the UTF-8 of the name ('Sensor')")
+        eq(plain["ts"] as? String, "2026-10-06T20:00:00.000Z", "ts on every object, --json included")
+        eq(plain["version"] as? String, "9.9", "version on every object")
         eq(plain["rssi"] as? Int, -50, "rssi")
         eq(plain["txPower"] as? Int, 4, "txPower")
         eq(plain["connectable"] as? Bool, true, "connectable")
@@ -700,13 +704,23 @@ let ibeaconBytes: [UInt8] =
         eq(plain["serviceNames"] as? [String], ["Battery (0x180F)"], "serviceNames beside them")
         eq(plain["solicitedServices"] as? [String], ["1811"], "solicited")
         eq(plain["overflowServices"] as? [String], ["1812"], "overflow")
-        for absent in ["ts", "beaconKey", "previousId", "continuity", "iBeacon", "eddystone", "serviceData"] {
+        for absent in ["beaconKey", "previousId", "continuity", "iBeacon", "eddystone", "serviceData"] {
             ok(plain[absent] == nil, "\(absent) omitted when not advertised")
         }
 
+        // Hostile names. JSONEncoder escapes C0 but not C1 or Cf, so `jq -r '.[].name'` used
+        // to write an 8-bit CSI (U+009B) straight into the terminal. `name` is sanitized
+        // like the table; the bytes as advertised are in `nameHex`.
+        let raw = "evil\u{9B}31m\u{202E}x"
+        let hostile = jsonObject(dev(name: raw))
+        eq(hostile["name"] as? String, "evil·31m·x", "name sanitized: C1 and Cf → ·")
+        eq(hostile["nameHex"] as? String, hexString(Array(raw.utf8)), "raw bytes preserved in nameHex")
+        ok((hostile["nameHex"] as? String)?.contains("c29b") == true, "…including the U+009B that was the problem")
+
         // An unnamed device with the RSSI sentinel: name and rssi are omitted, not nulled.
         let bare = jsonObject(dev(id: "ID2", name: nil, rssi: 127))
-        ok(bare["name"] == nil && bare["rssi"] == nil, "unnamed + unavailable RSSI → fields omitted")
+        ok(bare["name"] == nil && bare["nameHex"] == nil && bare["rssi"] == nil,
+           "unnamed + unavailable RSSI → fields omitted")
         ok(bare["companyId"] == nil && bare["txPower"] == nil && bare["connectable"] == nil,
            "no manufacturer data / tx / connectable → omitted")
         ok(bare["manufacturerHex"] == nil, "no manufacturer data → manufacturerHex omitted")
@@ -719,8 +733,9 @@ let ibeaconBytes: [UInt8] =
                          svcData: [ServiceDatum(uuid: "FEAA", bytes: [0x10, 0xEC, 0x02, 0x67, 0x6F, 0x07]),
                                    ServiceDatum(uuid: "180F", bytes: [])])
         beacon.previousID = "OLD"
-        let b = jsonObject(beacon, ts: "2026-10-06T20:00:00.000Z")
-        eq(b["ts"] as? String, "2026-10-06T20:00:00.000Z", "ts carried when given")
+        let b = jsonObject(beacon, ts: "2026-10-06T21:30:00.500Z", version: "1.2")
+        eq(b["ts"] as? String, "2026-10-06T21:30:00.500Z", "ts is the caller's stamp")
+        eq(b["version"] as? String, "1.2", "version is the caller's")
         let ib = b["iBeacon"] as? [String: Any]
         eq(ib?["uuid"] as? String, "01010101-0101-0101-0101-010101010101", "iBeacon uuid")
         eq(ib?["major"] as? Int, 42, "iBeacon major")
