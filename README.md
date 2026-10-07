@@ -202,7 +202,7 @@ blescan --help           # usage summary
 |------|-------------|
 | `--once` | Single scan (6 s); print the device table, then exit. |
 | `--json` | Single scan (6 s); emit a JSON array on stdout (exit 3 if the adapter never powered on). |
-| `--stream` | Emit [NDJSON](#json-output) for as long as the process runs — one line per device per packet, throttled to one line per device per second. Exit 3 if the adapter never powers on. |
+| `--stream` | Emit [NDJSON](#json-output) for as long as the process runs — one line per device per packet, throttled to one line per device per second. Exit 3 if the adapter never powers on, 4 if it goes away mid‑run. |
 | `--diag` | Print version, adapter state, permission status and device/name counts (3 s scan). |
 | `--window N` | Seconds to scan in the headless modes (`--window=N` works too). For `--stream`, a stop time instead of running forever. |
 | `--sort KEY` | `rssi` (default), `name`, `vendor`, `type`, `age` or `rate` — the TUI's sort keys, for any mode. `--reverse` flips it. |
@@ -390,6 +390,11 @@ it was written. It runs until killed, or until `--window N` seconds elapse:
 blescan --stream | jq -c 'select(.type == "Find My / AirTag") | {ts, id, rssi}'
 blescan --stream --window 300 > capture.ndjson        # five minutes, then exit
 ```
+
+**Exit status:** `0` when the window elapses, `3` if the adapter never powered on (nothing
+was ever scanned), `4` if it was on and then went away mid‑run (Bluetooth switched off,
+permission revoked) — the stderr line says after how many seconds. A signal exits
+`128 + signal`, so `timeout` and `kill` read as what they are, not as success.
 
 ## Honesty notes & known limitations
 

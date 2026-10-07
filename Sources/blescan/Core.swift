@@ -1070,6 +1070,24 @@ func headlessScanFailure(poweredOn: Bool, state: String, authorization: String) 
     poweredOn ? nil : "blescan: no scan performed — adapter \(state), permission \(authorization)"
 }
 
+/// Exit statuses, so a script can tell the outcomes apart: 0 ok · 1 runtime error (no
+/// terminal for the TUI) · 2 usage · 3 no scan performed (the adapter never powered on) ·
+/// 4 the adapter went away mid-stream (`--stream` only, see `streamInterrupted`).
+enum ExitStatus {
+    static let runtime: Int32 = 1
+    static let usage: Int32 = 2
+    static let noScan: Int32 = 3
+    static let adapterLost: Int32 = 4
+}
+
+/// Diagnostic for a `--stream` run whose adapter WAS on and then went away — Bluetooth
+/// switched off, permission revoked — after `seconds` of valid NDJSON. Distinct from
+/// `headlessScanFailure`: that one means nothing was ever scanned, and answering ten
+/// minutes of output with "no scan performed" and exit 3 was wrong on both counts.
+func streamInterrupted(state: String, afterSeconds seconds: Double) -> String {
+    "blescan: adapter went \(state) after \(Int(seconds.rounded())) s — stream ended"
+}
+
 // MARK: - Bluetooth SIG assigned numbers (curated subsets)
 //
 // macOS gives no OUI/MAC, so vendor identity comes from these two SIG tables: the company

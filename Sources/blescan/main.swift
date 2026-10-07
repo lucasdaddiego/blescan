@@ -703,8 +703,10 @@ private func readInput() -> Input {
 
 func runInteractive(app: App) {
     prepareSignalSafeLeave()   // before the handlers: they must never build it themselves
+    // Exit 128 + the signal number, the shell convention: `timeout 10 blescan` and a
+    // `kill` from a teardown script used to read as success (0).
     for sig in [SIGINT, SIGTERM] {
-        signal(sig) { _ in leaveRawFromSignal(); _exit(0) }
+        signal(sig) { s in leaveRawFromSignal(); _exit(128 + s) }
     }
     atexit { leaveRaw() }
     enterRaw()
@@ -1117,7 +1119,7 @@ private func failIfNeverScanned(_ app: App) {
                                          state: stateLabel(app.snapshotState()),
                                          authorization: authLabel(app.radio.authorization)) {
         writeStderr(problem)
-        exit(3)
+        exit(ExitStatus.noScan)
     }
 }
 
@@ -1144,6 +1146,11 @@ func runOnce(app: App, window: TimeInterval, json: Bool) {
 /// line per device per packet, throttled to at most one line per device per second so a
 /// chatty beacon (allow-duplicates delivers every packet, tens a second) can't flood the
 /// pipe; a silent device produces nothing. Each line is the `--json` object plus `ts`.
+///
+/// Two ways the adapter can be off, two exit statuses: never powered on → 3 ("no scan
+/// performed", like --json); powered on and then lost (Bluetooth switched off at minute
+/// ten, permission revoked) → 4, with the uptime in the stderr line. Both used to exit 3
+/// with "no scan performed" after any amount of valid output.
 func runStream(app: App, window: TimeInterval?) {
     setvbuf(stdout, nil, _IOLBF, 0)   // a pipe is block-buffered by default: flush per line
     app.wireRadio()
@@ -1151,13 +1158,21 @@ func runStream(app: App, window: TimeInterval?) {
     let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
     let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     let start = now()
+    var everPoweredOn = false
     var writtenAt: [String: Double] = [:]        // id → when we last wrote it
     var writtenSeen: [String: Double] = [:]      // id → the lastSeen that line carried
     while true {
         let t = now()
         if let w = window, t - start >= w { break }
         let state = app.snapshotState()
-        if state == .poweredOff || state == .unauthorized || state == .unsupported { failIfNeverScanned(app) }
+        if state == .poweredOn { everPoweredOn = true }
+        if state == .poweredOff || state == .unauthorized || state == .unsupported {
+            if everPoweredOn {
+                writeStderr(streamInterrupted(state: stateLabel(state), afterSeconds: t - start))
+                exit(ExitStatus.adapterLost)
+            }
+            failIfNeverScanned(app)
+        }
         app.prune(at: t, drop: 60)
         let live = app.snapshotDevices(at: t)
         for d in app.visible(live) where d.lastSeen > (writtenSeen[d.id] ?? -1) && t - (writtenAt[d.id] ?? -1) >= 1 {
@@ -1174,7 +1189,9 @@ func runStream(app: App, window: TimeInterval?) {
         Thread.sleep(forTimeInterval: 0.1)
     }
     app.radio.stop()
-    failIfNeverScanned(app)
+    // The window ran out. "No scan performed" only if the adapter never came up: a stream
+    // that produced output and ended in `.resetting` is still a completed stream.
+    if !everPoweredOn { failIfNeverScanned(app) }
 }
 
 func runDiag(app: App, window: TimeInterval) {
@@ -1229,7 +1246,9 @@ func printHelp() {
                          (the view flags seed the TUI too: `blescan --sort name --named`)
 
     --json and --stream exit 3 (with a line on stderr) when the adapter never powered on,
-    so an empty result from a quiet room is distinguishable from a scan that never happened.
+    so an empty result from a quiet room is distinguishable from a scan that never happened;
+    --stream exits 4 when the adapter goes away mid-run (Bluetooth switched off, permission
+    revoked). Usage errors exit 2; a signal exits 128 + its number.
 
     Colour is automatic: on in a terminal, off when piped/redirected (or set NO_COLOR).
 
@@ -1245,7 +1264,7 @@ func main() {
     let opts: Options
     switch parseArguments(Array(CommandLine.arguments.dropFirst())) {
     case .success(let o): opts = o
-    case .failure(let e): writeStderr(e.message); exit(2)
+    case .failure(let e): writeStderr(e.message); exit(ExitStatus.usage)
     }
 
     Ansi.enabled = ProcessInfo.processInfo.environment["NO_COLOR"] == nil && isatty(STDOUT_FILENO) != 0
@@ -1266,11 +1285,11 @@ func main() {
         // point the user at the headless modes instead.
         if isatty(STDOUT_FILENO) == 0 || isatty(STDIN_FILENO) == 0 {
             writeStderr("blescan: the interactive TUI needs a terminal on stdin and stdout — use --once, --json or --stream when piping.")
-            exit(1)
+            exit(ExitStatus.runtime)
         }
         if opts.window != nil {
             writeStderr("blescan: --window only applies to the headless modes (--once, --json, --stream, --diag).")
-            exit(2)
+            exit(ExitStatus.usage)
         }
         runInteractive(app: app)
     }

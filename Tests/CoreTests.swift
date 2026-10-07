@@ -588,6 +588,18 @@ let ibeaconBytes: [UInt8] =
         eq(headlessScanFailure(poweredOn: false, state: "unauthorized", authorization: "denied"),
            "blescan: no scan performed — adapter unauthorized, permission denied",
            "permission denial is named in the reason")
+
+        // A stream that ran and then lost its adapter is not "no scan performed": it gets
+        // its own reason and its own exit status, so `timeout`-style wrappers and cron jobs
+        // can tell "Bluetooth was off all along" from "it went off at minute ten".
+        eq(streamInterrupted(state: "poweredOff", afterSeconds: 600.4),
+           "blescan: adapter went poweredOff after 600 s — stream ended", "mid-stream loss names the state and the uptime")
+        eq(streamInterrupted(state: "unauthorized", afterSeconds: 0.6),
+           "blescan: adapter went unauthorized after 1 s — stream ended", "uptime is rounded to whole seconds")
+        ok(ExitStatus.usage == 2 && ExitStatus.noScan == 3 && ExitStatus.adapterLost == 4 && ExitStatus.runtime == 1,
+           "exit statuses: 1 runtime · 2 usage · 3 no scan · 4 adapter lost")
+        ok(Set([ExitStatus.runtime, ExitStatus.usage, ExitStatus.noScan, ExitStatus.adapterLost]).count == 4,
+           "every outcome has a distinct exit status")
     }
 
     // MARK: Device computed properties
