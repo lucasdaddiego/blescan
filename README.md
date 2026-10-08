@@ -133,8 +133,8 @@ TUI — nothing to install, and nothing between you and the raw advert bytes.
 ## Install
 
 ```sh
-make install    # build + sign the optimised `blescan` binary into ~/.bin
-make uninstall  # remove it
+make install    # build + sign the optimised binary into bin/, link it from ~/.bin
+make uninstall  # remove the link
 ```
 
 Or grab the universal (Apple Silicon + Intel) zip from the
@@ -146,8 +146,8 @@ with a personal certificate, keeps the Bluetooth grant across upgrades (below).
 
 `make install` compiles an optimised, fully‑stripped binary (no debug info), **embeds the
 `Info.plist`** into the Mach‑O (so a bundle‑less CLI can still request Bluetooth — see
-[below](#how-the-permission-prompt-works-no-app-bundle)), ad‑hoc code‑signs it, and drops
-a **`blescan`** command into **`~/.bin`**.
+[below](#how-the-permission-prompt-works-no-app-bundle)), ad‑hoc code‑signs it as `bin/blescan`, and links
+a **`blescan`** command from **`~/.bin`** to it.
 
 Make sure `~/.bin` is on your `PATH`:
 
@@ -166,7 +166,7 @@ prompts; click **Allow**. If you miss it:
 
 ### Keep the grant across rebuilds (optional)
 
-Ad‑hoc signing gives the binary a new identity on every `make install`, so macOS forgets the
+Ad‑hoc signing gives the binary a new identity on every `make build` or `make install`, so macOS forgets the
 grant and re‑prompts. To make it **stick across rebuilds**, sign with a stable
 self‑signed certificate:
 
@@ -444,7 +444,7 @@ under the binary's name — no `.app` wrapper, no Apple Developer account, no sp
 entitlement. (This is the BLE analogue of how
 [macos‑wifi‑scan](https://github.com/lucasdaddiego/macos-wifi-scan) ships an Info.plist
 for its **Location** requirement — different permission, same embed trick.) Because the
-ad‑hoc signature changes every build, the grant resets on each `make install`; sign with a
+ad‑hoc signature changes every build, the grant resets on each `make build` or `make install`; sign with a
 [stable cert](#keep-the-grant-across-rebuilds-optional) to keep it.
 
 ## Architecture
@@ -488,7 +488,7 @@ scripts/check-coverage.sh    coverage gate — fails unless Core.swift is 100% r
 .github/workflows/ci.yml     GitHub Actions: debug + release build, tests, coverage gate on every push/PR
 .github/workflows/release.yml GitHub Actions: on a v* tag, `make dist` → universal zip + SHA256SUMS → GitHub release
 Info.plist                   Bluetooth usage string, embedded into the binary at link time
-Makefile                     `make install` → signed blescan in ~/.bin; `make test` / `make coverage`
+Makefile                     `make install` → signed bin/blescan, linked from ~/.bin; `make test` / `make coverage`
 Package.swift                SwiftPM manifest (for editors/tooling/CI; the Makefile uses swiftc)
 Makefile.local               optional, git-ignored: machine-local SIGN identity
 ```
@@ -500,14 +500,14 @@ frameworks.
 
 ```sh
 make                       # list targets (default; ≡ make help)
-make install               # build + sign + install into ~/.bin
-make build                 # build + sign ./blescan locally, no install (quick compile)
-make run ARGS=--diag       # build, then run ./blescan with flags (≡ make diag)
+make install               # build + sign bin/blescan, link it from ~/.bin
+make build                 # build + sign bin/blescan (the linked file, so it replaces the live command)
+make run ARGS=--diag       # build, then run bin/blescan with flags (≡ make diag)
 make test                  # run the core unit tests (no Xcode/XCTest needed — CLT only)
 make coverage              # run tests under llvm-cov; fails unless Core.swift is 100% covered
 make dist                  # universal (arm64 + x86_64) signed binary + zip + SHA256SUMS in .build/dist
 make release               # tag v<Info.plist version> and push it; CI builds + publishes the release
-make clean                 # remove build artifacts (make uninstall removes ~/.bin/blescan)
+make clean                 # remove build artifacts, bin/ included (make uninstall removes the ~/.bin link)
 ```
 
 **Releasing:** bump `CFBundleShortVersionString` in `Info.plist`, commit, push, `make release`

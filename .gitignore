@@ -1,4 +1,6 @@
-# Build artifacts (the release binary is deployed to ~/.bin, never committed)
+# Build artifacts, never committed: bin/blescan is the build ~/.bin/blescan links to;
+# /blescan is where older Makefiles put it
+/bin/
 /blescan
 .build/
 _CodeSignature/

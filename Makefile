@@ -1,6 +1,6 @@
 # blescan — live terminal BLE scanner & fingerprinter (Swift / CoreBluetooth).
 # `make` (or `make help`) lists the targets; `make install` builds a single
-# self-contained `blescan` binary and installs it on PATH.
+# self-contained `blescan` binary into bin/ and links it from ~/.bin (on PATH).
 #
 # Why no .app bundle? Unlike Wi-Fi SSIDs (which macOS reveals only to a real
 # LaunchServices app session), BLE scanning just needs the Bluetooth TCC grant.
@@ -12,6 +12,8 @@
 -include Makefile.local
 
 BINARY      := blescan
+# The built, signed binary. Not the repo root: see the build rule.
+OUT         := bin/$(BINARY)
 # Core.swift = pure, framework-free logic (also compiled standalone by `make test`
 # and held at 100% coverage by `make coverage`); main.swift = CoreBluetooth, the
 # TUI, and the entrypoint.
@@ -23,7 +25,7 @@ BUILD_DIR   := .build
 COV_DIR     := $(BUILD_DIR)/coverage
 TEST_BIN    := $(BUILD_DIR)/blescan-tests
 PLIST       := Info.plist
-INSTALL_DIR := $(HOME)/.bin
+INSTALL_DIR ?= $(HOME)/.bin
 BUNDLE_ID   := com.lucasdaddiego.blescan
 # The version is owned by Info.plist (CFBundleShortVersionString) — `--version` reads it
 # from the embedded plist at runtime, `make release` tags from it.
@@ -64,10 +66,10 @@ ARCHS       ?= arm64 x86_64
 .PHONY: help build install run diag test coverage dist release clean uninstall
 
 help: ## List all targets
-	@echo "blescan — make targets ('make install' builds + installs):"
+	@echo "blescan — make targets ('make install' builds + links):"
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[1m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-build: $(BINARY) ## Build the optimised, signed ./blescan (no install)
+build: $(OUT) ## Build the optimised, signed bin/blescan (the file ~/.bin/blescan links to)
 
 # File rule = real dependency tracking: relink only when the sources, the embedded
 # plist, or the build flags (this Makefile) actually change. Stripping happens at
@@ -81,23 +83,25 @@ build: $(BINARY) ## Build the optimised, signed ./blescan (no install)
 # _CodeSignature/CodeResources beside the sources, leaves the embedded plist unbound,
 # and fails outright on anything it can't seal (git's fsmonitor socket in .git/).
 # Signed as a bare Mach-O the seal lives in the file, so the move keeps it intact.
-$(BINARY): $(SRC) $(PLIST) Makefile
-	@mkdir -p "$(BUILD_DIR)"
+# The same applies to where the file finally sits: in the repo root, beside
+# Info.plist, `codesign --verify ./blescan` fails ("code has no resources but
+# signature indicates they must be present"); in bin/ the same bytes verify. That
+# matters because ~/.bin/blescan is a symlink, and macOS checks the resolved path.
+$(OUT): $(SRC) $(PLIST) Makefile
+	@mkdir -p "$(BUILD_DIR)" bin
 	$(SWIFTC) $(SWIFTFLAGS) $(RELEASE) $(EMBED_PLIST) $(SRC) -o "$(BUILD_DIR)/$(BINARY)" $(FRAMEWORKS)
 	codesign --force --sign $(SIGN) --identifier $(BUNDLE_ID) "$(BUILD_DIR)/$(BINARY)"
 	mv -f "$(BUILD_DIR)/$(BINARY)" $@
 	@echo "built ./$@ ($$(du -h $@ | cut -f1)), signed as '$(SIGN)'"
 
-# Copy, then re-sign in place. The copy already carries a valid signature (the seal
-# lives in the Mach-O now that ./blescan is signed as a bare binary, see above); the
-# re-sign is belt-and-braces so the installed file's signature and Bluetooth TCC
-# identity never depend on what the copy step did. (Stability across rebuilds still
-# needs a real SIGN cert, per the note above; ad-hoc re-keys every build.)
-install: $(BINARY) ## Build and install blescan into ~/.bin
+# Link, not copy: ~/.bin holds only symlinks. The build rule already signed bin/blescan
+# with the bundle id, so the link runs exactly that file. Ad-hoc signing re-keys every
+# build, so `make build` and `make install` both reset the Bluetooth grant; a real SIGN
+# cert keeps it (see the note above).
+install: $(OUT) ## Build, then link ~/.bin/blescan to bin/blescan
 	@mkdir -p "$(INSTALL_DIR)"
-	cp -f "$(BINARY)" "$(INSTALL_DIR)/$(BINARY)"
-	codesign --force --sign $(SIGN) --identifier $(BUNDLE_ID) "$(INSTALL_DIR)/$(BINARY)"
-	@echo "installed $(INSTALL_DIR)/$(BINARY)"
+	ln -sfn "$(CURDIR)/$(OUT)" "$(INSTALL_DIR)/$(BINARY)"
+	@echo "linked $(INSTALL_DIR)/$(BINARY) -> $(CURDIR)/$(OUT)"
 	@echo
 	@echo "one-time permission:"
 	@echo "  1. run \`$(BINARY)\` once  (triggers the Bluetooth prompt)"
@@ -105,11 +109,11 @@ install: $(BINARY) ## Build and install blescan into ~/.bin
 	@echo "     (or click Allow on the prompt)"
 	@echo "  3. rerun \`$(BINARY)\`; \`$(BINARY) --diag\` should report state poweredOn"
 
-run: $(BINARY) ## Build, then run ./blescan locally (pass flags via ARGS=…)
-	./$(BINARY) $(ARGS)
+run: $(OUT) ## Build, then run bin/blescan locally (pass flags via ARGS=…)
+	./$(OUT) $(ARGS)
 
-diag: $(BINARY) ## Build, then run ./blescan --diag (report Bluetooth state)
-	./$(BINARY) --diag
+diag: $(OUT) ## Build, then run bin/blescan --diag (report Bluetooth state)
+	./$(OUT) --diag
 
 test: ## Build & run the dependency-free core unit tests (no Xcode/XCTest needed)
 	@mkdir -p "$(BUILD_DIR)"
@@ -155,11 +159,12 @@ release: ## Tag v$(VERSION) (from Info.plist) and push the tag — CI builds + p
 	@echo "tagged v$(VERSION) — follow the release build with: gh run watch"
 
 # _CodeSignature/ is the stale seal an older Makefile left at the repo root (it signed the
-# binary in place, and codesign treated the root as a flat bundle — see the build rule).
-clean: ## Remove local build artifacts (leaves the installed binary — see uninstall)
-	rm -rf "$(BINARY)" "$(COV_DIR)" "$(DIST_DIR)" "$(TEST_BIN)" _CodeSignature
+# binary in place, and codesign treated the root as a flat bundle — see the build rule);
+# ./blescan is where older Makefiles put the build.
+clean: ## Remove local build artifacts, bin/ included (the ~/.bin link dangles until make install)
+	rm -rf bin "$(BINARY)" "$(COV_DIR)" "$(DIST_DIR)" "$(TEST_BIN)" _CodeSignature
 
-uninstall: ## Remove the installed binary from ~/.bin
+uninstall: ## Remove the ~/.bin/blescan link (leaves bin/)
 	rm -f "$(INSTALL_DIR)/$(BINARY)"
 	@echo "removed $(INSTALL_DIR)/$(BINARY)"
 	@echo "note: the Bluetooth permission entry remains in System Settings → Privacy & Security."
