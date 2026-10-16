@@ -387,6 +387,10 @@ final class App {
     private var linker = IdentityLinker()
     var generation = 0
     var radioState: CBManagerState = .unknown
+    /// Whether the adapter has reached poweredOn at any point, and when (monotonic, see
+    /// `now()`) it entered its current state — what the headless modes report on exit.
+    private var everPoweredOn = false
+    private var stateSince = now()
 
     static let historyLen = 24
 
@@ -456,10 +460,25 @@ final class App {
         return true
     }
 
-    func setState(_ s: CBManagerState) { lock.lock(); radioState = s; generation += 1; lock.unlock() }
+    func setState(_ s: CBManagerState) {
+        lock.lock(); defer { lock.unlock() }
+        if s != radioState { stateSince = now() }
+        radioState = s
+        if s == .poweredOn { everPoweredOn = true }
+        generation += 1
+    }
     func markDirty() { lock.lock(); generation += 1; lock.unlock() }
     func readGeneration() -> Int { lock.lock(); defer { lock.unlock() }; return generation }
     func snapshotState() -> CBManagerState { lock.lock(); defer { lock.unlock() }; return radioState }
+    /// How a headless run that started at `runStart` stands right now (see HeadlessOutcome).
+    func outcome(runStart: Double, ending: String) -> HeadlessOutcome {
+        lock.lock()
+        let state = radioState, ever = everPoweredOn, since = stateSince
+        lock.unlock()
+        return HeadlessOutcome(everPoweredOn: ever, state: stateLabel(state),
+                               authorization: authLabel(radio.authorization),
+                               stateSeconds: since - runStart, ending: ending)
+    }
     /// Every device, each stamped with its advert rate as of `t` (the rate decays between
     /// packets, so it is evaluated at read time rather than stored at ingest).
     func snapshotDevices(at t: Double) -> [Device] {
@@ -962,31 +981,30 @@ func footerLines(_ cols: Int) -> [String] {
 // MARK: - Non-interactive collection (--once / --json / --stream / --diag)
 
 /// Start the radio and block `window` seconds while the BLE queue accumulates devices,
-/// then return the snapshot. The window also covers the adapter's ramp to poweredOn.
-private func collect(app: App, window: TimeInterval) -> [Device] {
+/// then return the snapshot and when the run started. The window also covers the
+/// adapter's ramp to poweredOn.
+private func collect(app: App, window: TimeInterval) -> (devices: [Device], start: Double) {
     app.wireRadio()
     app.radio.start()
+    let start = now()
     Thread.sleep(forTimeInterval: window)
     app.radio.stop()
-    return app.snapshotDevices(at: now())
+    return (app.snapshotDevices(at: now()), start)
 }
 
 private func writeStderr(_ line: String) { FileHandle.standardError.write(Data((line + "\n").utf8)) }
 
-/// `--json` exits 3 (with a line on stderr) if the radio never came up, so a caller can
-/// tell an empty room from a scan that never happened. (--once prints its own hint line
-/// and --diag reports the state, so the JSON modes were the only ones with no signal.)
-private func failIfNeverScanned(_ app: App) {
-    if let problem = headlessScanFailure(poweredOn: app.snapshotState() == .poweredOn,
-                                         state: stateLabel(app.snapshotState()),
-                                         authorization: authLabel(app.radio.authorization)) {
-        writeStderr(problem)
-        exit(ExitStatus.noScan)
-    }
+/// Report a headless outcome: its line on stderr and its exit status, or nothing when the
+/// run succeeded. (--once prints its own hint line and --diag reports the state, so only
+/// the JSON modes use this.)
+private func finish(_ outcome: HeadlessOutcome) {
+    if let m = outcome.message { writeStderr(m) }
+    if let code = outcome.exitStatus { exit(code) }
 }
 
 func runOnce(app: App, window: TimeInterval, json: Bool) {
-    let devices = app.visible(collect(app: app, window: window))   // --filter / --sort / toggles
+    let (all, start) = collect(app: app, window: window)
+    let devices = app.visible(all)   // --filter / --sort / toggles
     let t = now()   // after the scan, so the ages are measured from the moment of output
     if json {
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -994,7 +1012,9 @@ func runOnce(app: App, window: TimeInterval, json: Bool) {
         let ts = iso.string(from: Date())   // one stamp for the whole array: it is one snapshot
         let arr = devices.map { DeviceJSON($0, now: t, ts: ts, version: blescanVersion) }
         if let data = try? enc.encode(arr), let s = String(data: data, encoding: .utf8) { print(s) } else { print("[]") }
-        failIfNeverScanned(app)
+        // The array is printed first in every case: a cut-short scan still hands over what
+        // it heard, and the exit status says how far to trust it.
+        finish(app.outcome(runStart: start, ending: "scan cut short"))
         return
     }
     print(Ansi.bold("blescan — \(devices.count) BLE devices\(app.filter.isEmpty && !app.connectableOnly && !app.namedOnly ? "" : " (filtered)")  (adapter \(stateLabel(app.snapshotState())), permission \(authLabel(app.radio.authorization)))"))
@@ -1012,10 +1032,9 @@ func runOnce(app: App, window: TimeInterval, json: Bool) {
 /// pipe; a silent device produces nothing. Each line is the `--json` object, stamped with
 /// its own `ts`.
 ///
-/// Two ways the adapter can be off, two exit statuses: never powered on → 3 ("no scan
-/// performed", like --json); powered on and then lost (Bluetooth switched off at minute
-/// ten, permission revoked) → 4, with the uptime in the stderr line. Both used to exit 3
-/// with "no scan performed" after any amount of valid output.
+/// Two ways the adapter can be off, two exit statuses (see HeadlessOutcome): never powered
+/// on → 3 ("no scan performed", like --json); powered on and then lost (Bluetooth switched
+/// off at minute ten, permission revoked) → 4, with the uptime in the stderr line.
 func runStream(app: App, window: TimeInterval?) {
     setvbuf(stdout, nil, _IOLBF, 0)   // a pipe is block-buffered by default: flush per line
     app.wireRadio()
@@ -1023,20 +1042,14 @@ func runStream(app: App, window: TimeInterval?) {
     let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
     let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     let start = now()
-    var everPoweredOn = false
     var writtenAt: [String: Double] = [:]        // id → when we last wrote it
     var writtenSeen: [String: Double] = [:]      // id → the lastSeen that line carried
     while true {
         let t = now()
         if let w = window, t - start >= w { break }
-        let state = app.snapshotState()
-        if state == .poweredOn { everPoweredOn = true }
-        if state == .poweredOff || state == .unauthorized || state == .unsupported {
-            if everPoweredOn {
-                writeStderr(streamInterrupted(state: stateLabel(state), afterSeconds: t - start))
-                exit(ExitStatus.adapterLost)
-            }
-            failIfNeverScanned(app)
+        // A gone adapter ends the stream at once: 3 if it was never on, 4 if it was.
+        if isAdapterGone(stateLabel(app.snapshotState())) {
+            finish(app.outcome(runStart: start, ending: "stream ended"))
         }
         app.prune(at: t, drop: 60)
         let live = app.snapshotDevices(at: t)
@@ -1056,11 +1069,11 @@ func runStream(app: App, window: TimeInterval?) {
     app.radio.stop()
     // The window ran out. "No scan performed" only if the adapter never came up: a stream
     // that produced output and ended in `.resetting` is still a completed stream.
-    if !everPoweredOn { failIfNeverScanned(app) }
+    finish(app.outcome(runStart: start, ending: "stream ended"))
 }
 
 func runDiag(app: App, window: TimeInterval) {
-    let devices = collect(app: app, window: window)
+    let devices = collect(app: app, window: window).devices
     let named = devices.filter { $0.isNamed }.count
     let state = app.snapshotState(), auth = app.radio.authorization
     print("blescan diagnostics")
@@ -1111,9 +1124,9 @@ func printHelp() {
                          (the view flags seed the TUI too: `blescan --sort name --named`)
 
     --json and --stream exit 3 (with a line on stderr) when the adapter never powered on,
-    so an empty result from a quiet room is distinguishable from a scan that never happened;
-    --stream exits 4 when the adapter goes away mid-run (Bluetooth switched off, permission
-    revoked). Usage errors exit 2; a signal exits 128 + its number.
+    so an empty result from a quiet room is distinguishable from a scan that never happened,
+    and 4 when it was on and went away mid-run (Bluetooth switched off, permission revoked):
+    --json still prints what it heard. Usage errors exit 2; a signal exits 128 + its number.
 
     Colour is automatic: on in a terminal, off when piped/redirected (or set NO_COLOR).
 

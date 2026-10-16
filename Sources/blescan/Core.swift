@@ -1174,19 +1174,19 @@ func applyView(_ devices: [Device], filter: String, connectableOnly: Bool, named
 
 // MARK: - Headless scan outcome
 
-/// Diagnostic for a headless (`--json`) scan whose adapter never reached
-/// poweredOn — nil when the scan actually ran. Bluetooth off, permission denied and "this
-/// Mac has no BLE" all end with zero devices heard, which on stdout is indistinguishable
-/// from a genuinely quiet room; `blescan --json | jq length` would read 0 and conclude
-/// "nothing nearby". The caller pairs this line (on stderr) with a non-zero exit status so
-/// a script can tell "nothing was there" from "nothing was listening".
-func headlessScanFailure(poweredOn: Bool, state: String, authorization: String) -> String? {
-    poweredOn ? nil : "blescan: no scan performed — adapter \(state), permission \(authorization)"
+/// Diagnostic for a headless (`--json` / `--stream`) scan whose adapter never reached
+/// poweredOn. Bluetooth off, permission denied and "this Mac has no BLE" all end with zero
+/// devices heard, which on stdout is indistinguishable from a genuinely quiet room;
+/// `blescan --json | jq length` would read 0 and conclude "nothing nearby". The caller
+/// pairs this line (on stderr) with a non-zero exit status so a script can tell "nothing
+/// was there" from "nothing was listening".
+func headlessScanFailure(state: String, authorization: String) -> String {
+    "blescan: no scan performed — adapter \(state), permission \(authorization)"
 }
 
 /// Exit statuses, so a script can tell the outcomes apart: 0 ok · 1 runtime error (no
 /// terminal for the TUI) · 2 usage · 3 no scan performed (the adapter never powered on) ·
-/// 4 the adapter went away mid-stream (`--stream` only, see `streamInterrupted`).
+/// 4 the adapter went away mid-run (`--json` / `--stream`, see `adapterLostMessage`).
 enum ExitStatus {
     static let runtime: Int32 = 1
     static let usage: Int32 = 2
@@ -1194,12 +1194,59 @@ enum ExitStatus {
     static let adapterLost: Int32 = 4
 }
 
-/// Diagnostic for a `--stream` run whose adapter WAS on and then went away — Bluetooth
-/// switched off, permission revoked — after `seconds` of valid NDJSON. Distinct from
+/// True for an adapter state that means the radio is gone, not merely ramping up
+/// (`unknown`) or `resetting`: Bluetooth off, permission revoked, no BLE at all.
+func isAdapterGone(_ state: String) -> Bool {
+    state == "poweredOff" || state == "unauthorized" || state == "unsupported"
+}
+
+/// Diagnostic for a headless run whose adapter WAS on and then went away — Bluetooth
+/// switched off, permission revoked — `seconds` into the run. Distinct from
 /// `headlessScanFailure`: that one means nothing was ever scanned, and answering ten
 /// minutes of output with "no scan performed" and exit 3 was wrong on both counts.
-func streamInterrupted(state: String, afterSeconds seconds: Double) -> String {
-    "blescan: adapter went \(state) after \(Int(seconds.rounded())) s — stream ended"
+/// `ending` says what the loss did to the output ("stream ended", "scan cut short").
+func adapterLostMessage(state: String, afterSeconds seconds: Double, ending: String) -> String {
+    "blescan: adapter went \(state) after \(Int(max(0, seconds).rounded())) s — \(ending)"
+}
+
+/// How a headless run ended. `everPoweredOn` is whether the adapter reached poweredOn at
+/// any point; `state` is its state now and `stateSeconds` how far into the run it changed
+/// to that state. Never on → no scan (3). On, and now gone → adapter lost (4) — for
+/// `--json` too: Bluetooth switched off two seconds into the six-second window used to
+/// exit 3 "no scan performed" with a non-empty array on stdout. On, and now on or merely
+/// resetting → ok: the window completed.
+enum HeadlessOutcome: Equatable {
+    case ok
+    case noScan(String)
+    case adapterLost(String)
+
+    init(everPoweredOn: Bool, state: String, authorization: String,
+         stateSeconds: Double, ending: String) {
+        if !everPoweredOn {
+            self = .noScan(headlessScanFailure(state: state, authorization: authorization))
+        } else if isAdapterGone(state) {
+            self = .adapterLost(adapterLostMessage(state: state, afterSeconds: stateSeconds, ending: ending))
+        } else {
+            self = .ok
+        }
+    }
+
+    /// The process exit status for this outcome, nil when the run succeeded.
+    var exitStatus: Int32? {
+        switch self {
+        case .ok:          return nil
+        case .noScan:      return ExitStatus.noScan
+        case .adapterLost: return ExitStatus.adapterLost
+        }
+    }
+
+    /// The stderr line for this outcome, nil when the run succeeded.
+    var message: String? {
+        switch self {
+        case .ok:                                     return nil
+        case .noScan(let m), .adapterLost(let m):     return m
+        }
+    }
 }
 
 // MARK: - JSON output (--json array element / --stream line)

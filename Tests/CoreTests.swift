@@ -646,24 +646,52 @@ let ibeaconBytes: [UInt8] =
     // MARK: Headless (--json) scan outcome
 
     static func testHeadlessOutcome() {
-        ok(headlessScanFailure(poweredOn: true, state: "poweredOn", authorization: "authorized") == nil,
-           "a scan that actually ran reports no failure")
         // Without this, --json prints "[]" and exits 0 whether the room was quiet or the
         // radio was never on, so `blescan --json | jq length` reads 0 for both.
-        eq(headlessScanFailure(poweredOn: false, state: "poweredOff", authorization: "authorized"),
+        eq(headlessScanFailure(state: "poweredOff", authorization: "authorized"),
            "blescan: no scan performed — adapter poweredOff, permission authorized",
            "adapter never powered on → a reason for stderr")
-        eq(headlessScanFailure(poweredOn: false, state: "unauthorized", authorization: "denied"),
+        eq(headlessScanFailure(state: "unauthorized", authorization: "denied"),
            "blescan: no scan performed — adapter unauthorized, permission denied",
            "permission denial is named in the reason")
 
-        // A stream that ran and then lost its adapter is not "no scan performed": it gets
+        // A run that scanned and then lost its adapter is not "no scan performed": it gets
         // its own reason and its own exit status, so `timeout`-style wrappers and cron jobs
         // can tell "Bluetooth was off all along" from "it went off at minute ten".
-        eq(streamInterrupted(state: "poweredOff", afterSeconds: 600.4),
+        eq(adapterLostMessage(state: "poweredOff", afterSeconds: 600.4, ending: "stream ended"),
            "blescan: adapter went poweredOff after 600 s — stream ended", "mid-stream loss names the state and the uptime")
-        eq(streamInterrupted(state: "unauthorized", afterSeconds: 0.6),
-           "blescan: adapter went unauthorized after 1 s — stream ended", "uptime is rounded to whole seconds")
+        eq(adapterLostMessage(state: "unauthorized", afterSeconds: 0.6, ending: "scan cut short"),
+           "blescan: adapter went unauthorized after 1 s — scan cut short", "uptime is rounded to whole seconds")
+        eq(adapterLostMessage(state: "poweredOff", afterSeconds: -3, ending: "x"),
+           "blescan: adapter went poweredOff after 0 s — x", "a state set before the run started reads as 0 s, never negative")
+
+        for gone in ["poweredOff", "unauthorized", "unsupported"] { ok(isAdapterGone(gone), "\(gone) is a gone adapter") }
+        for live in ["poweredOn", "resetting", "unknown"] { ok(!isAdapterGone(live), "\(live) is not a gone adapter") }
+
+        func outcome(_ ever: Bool, _ state: String) -> HeadlessOutcome {
+            HeadlessOutcome(everPoweredOn: ever, state: state, authorization: "authorized",
+                            stateSeconds: 2.2, ending: "scan cut short")
+        }
+        eq(outcome(true, "poweredOn"), .ok, "on for the whole window → ok")
+        eq(outcome(true, "resetting"), .ok, "on, then resetting at the end → still a completed run")
+        eq(outcome(false, "unknown"),
+           .noScan("blescan: no scan performed — adapter unknown, permission authorized"),
+           "never reached poweredOn → no scan")
+        eq(outcome(false, "poweredOff"),
+           .noScan("blescan: no scan performed — adapter poweredOff, permission authorized"),
+           "off all along → no scan, not adapter lost")
+        // The --json bug: Bluetooth switched off two seconds into the six-second window
+        // exited 3 "no scan performed" although the array on stdout held what it had heard.
+        eq(outcome(true, "poweredOff"),
+           .adapterLost("blescan: adapter went poweredOff after 2 s — scan cut short"),
+           "on, then switched off inside the window → adapter lost")
+        eq(outcome(true, "poweredOn").exitStatus, nil, "ok → no exit status")
+        eq(outcome(true, "poweredOn").message, nil, "ok → no stderr line")
+        eq(outcome(false, "unknown").exitStatus, 3, "no scan → 3")
+        eq(outcome(true, "unsupported").exitStatus, 4, "adapter lost → 4")
+        eq(outcome(true, "unsupported").message, "blescan: adapter went unsupported after 2 s — scan cut short",
+           "adapter lost → its stderr line")
+
         ok(ExitStatus.usage == 2 && ExitStatus.noScan == 3 && ExitStatus.adapterLost == 4 && ExitStatus.runtime == 1,
            "exit statuses: 1 runtime · 2 usage · 3 no scan · 4 adapter lost")
         ok(Set([ExitStatus.runtime, ExitStatus.usage, ExitStatus.noScan, ExitStatus.adapterLost]).count == 4,

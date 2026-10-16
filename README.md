@@ -201,7 +201,7 @@ blescan --help           # usage summary
 | Flag | Description |
 |------|-------------|
 | `--once` | Single scan (6 s); print the device table, then exit. |
-| `--json` | Single scan (6 s); emit a JSON array on stdout (exit 3 if the adapter never powered on). |
+| `--json` | Single scan (6 s); emit a JSON array on stdout (exit 3 if the adapter never powered on, 4 if it went away inside the window). |
 | `--stream` | Emit [NDJSON](#json-output) for as long as the process runs — one line per device per packet, throttled to one line per device per second. Exit 3 if the adapter never powers on, 4 if it goes away mid‑run. |
 | `--diag` | Print version, adapter state, permission status and device/name counts (3 s scan). |
 | `--window N` | Seconds to scan in the headless modes (`--window=N` works too). For `--stream`, a stop time instead of running forever. |
@@ -337,7 +337,9 @@ are in **`nameHex`**. Every object carries **`ts`** (when it was written, ISO 86
 **`version`** (the blescan that wrote it), so a saved capture explains itself. If the
 adapter never reaches `poweredOn` (Bluetooth off, permission denied, no BLE support) the
 array is still printed, but a one‑line reason goes to stderr and the exit status is **3**
-— so a script never mistakes "the radio was off" for "nobody was advertising":
+— so a script never mistakes "the radio was off" for "nobody was advertising". If the
+adapter was on and went away inside the window (Bluetooth switched off, permission revoked)
+the array holds what was heard until then, and the exit status is **4**:
 
 ```jsonc
 [
