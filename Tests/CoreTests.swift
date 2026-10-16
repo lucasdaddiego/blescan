@@ -307,6 +307,14 @@ let ibeaconBytes: [UInt8] =
                   dev(id: "c", rssi: -30, svc: ["180D"])]
         eq(order(sortDevices(ty, by: .type, ascending: false)), "cab", "type Heart-rate(<Keyboard) tie by rssi")
 
+        // Text keys are case-insensitive, like name. A plain `<` sorted "iBeacon" after
+        // "Keyboard / mouse (HID)" and the vendor "vivo" (0x0837) after "Xiaomi" (0x038F).
+        let ci = [dev(id: "k", svc: ["1812"]), dev(id: "i", mfg: ibeaconBytes), dev(id: "h", svc: ["180D"])]
+        eq(order(sortDevices(ci, by: .type, ascending: false)), "hik",
+           "type: Heart-rate < iBeacon < Keyboard, whatever the case")
+        let cv = [dev(id: "x", mfg: [0x8F, 0x03]), dev(id: "v", mfg: [0x37, 0x08]), dev(id: "s", mfg: [0x2D, 0x01])]
+        eq(order(sortDevices(cv, by: .vendor, ascending: false)), "svx", "vendor: Sony < vivo < Xiaomi, whatever the case")
+
         // age: most-recently-seen first; equal lastSeen ties by rssi.
         let g = [dev(id: "a", rssi: -50, last: 10), dev(id: "b", rssi: -40, last: 30),
                  dev(id: "c", rssi: -30, last: 30)]

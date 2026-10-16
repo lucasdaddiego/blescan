@@ -607,7 +607,9 @@ private func rssiThenID(_ a: Device, _ b: Device) -> Bool {
 
 /// Strict ordering of two devices for `key`'s default direction. Every key falls back to
 /// RSSI then the stable identifier so the order is total (extracted from `sortDevices` so
-/// each branch is unit-testable). Named devices sort before unnamed in name order.
+/// each branch is unit-testable). Named devices sort before unnamed in name order. The
+/// text keys compare the cached lowercase forms: a plain `<` puts every lowercase-first
+/// label ("iBeacon", "iPhone", the vendor "vivo") after all the capitalised ones.
 func deviceBefore(_ a: Device, _ b: Device, by key: SortKey) -> Bool {
     switch key {
     case .rssi:
@@ -616,10 +618,10 @@ func deviceBefore(_ a: Device, _ b: Device, by key: SortKey) -> Bool {
         if a.isNamed != b.isNamed { return a.isNamed }   // named first
         let an = a.displayNameLower, bn = b.displayNameLower   // cached: no lowercasing per comparison
         return an != bn ? an < bn : rssiThenID(a, b)
-    case .vendor:
-        return a.vendor != b.vendor ? a.vendor < b.vendor : rssiThenID(a, b)
-    case .type:
-        return a.typeLabel != b.typeLabel ? a.typeLabel < b.typeLabel : rssiThenID(a, b)
+    case .vendor:   // case-insensitive like .name: "vivo" sorts between "Sony" and "Xiaomi"
+        return a.vendorLower != b.vendorLower ? a.vendorLower < b.vendorLower : rssiThenID(a, b)
+    case .type:     // "iBeacon" / "iPhone" sort among the I's, not after "Xiaomi device"
+        return a.typeLower != b.typeLower ? a.typeLower < b.typeLower : rssiThenID(a, b)
     case .age:
         return a.lastSeen != b.lastSeen ? a.lastSeen > b.lastSeen : rssiThenID(a, b)
     case .rate:
