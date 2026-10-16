@@ -527,19 +527,25 @@ private let leaveSequence = "\u{1B}[?1006l\u{1B}[?1000l\u{1B}[?25h\u{1B}[?1049l\
 nonisolated(unsafe) private var leaveBytes: UnsafeMutablePointer<UInt8>?
 nonisolated(unsafe) private var leaveByteCount = 0
 
-/// Write a string straight to the fd, looping over partial writes and retrying on EINTR.
-/// Used for every byte we emit in raw mode (enter/leave sequences AND each frame), so the
-/// TUI never mixes buffered stdio with raw writes — a full frame can be several KB and a
-/// single write() may not take it all.
-private func writeRaw(_ s: String) {
-    let bytes = Array(s.utf8)
+/// Write `count` bytes to stdout, looping over partial writes and retrying on EINTR; give
+/// up only on a real error or a zero-byte write. Async-signal-safe (write(2) and nothing
+/// else), so the frame path and the signal handler share this one loop.
+private func writeAll(_ p: UnsafePointer<UInt8>, _ count: Int) {
     var off = 0
-    while off < bytes.count {
-        let n = bytes.withUnsafeBytes { write(STDOUT_FILENO, $0.baseAddress!.advanced(by: off), bytes.count - off) }
-        if n < 0 { if errno == EINTR { continue }; break }   // unrecoverable error → give up
-        if n == 0 { break }
+    while off < count {
+        let n = write(STDOUT_FILENO, p + off, count - off)
+        if n < 0 { if errno == EINTR { continue }; return }
+        if n == 0 { return }
         off += n
     }
+}
+
+/// Write a string straight to the fd. Used for every byte we emit in raw mode (enter/leave
+/// sequences AND each frame), so the TUI never mixes buffered stdio with raw writes — a
+/// full frame can be several KB and a single write() may not take it all.
+private func writeRaw(_ s: String) {
+    let bytes = Array(s.utf8)
+    bytes.withUnsafeBufferPointer { if let base = $0.baseAddress { writeAll(base, $0.count) } }
 }
 
 /// Snapshot the leave sequence into a plain C buffer. MUST run before the signal handlers
@@ -590,15 +596,7 @@ private func leaveRaw() {
 private func leaveRawFromSignal() {
     guard rawActive != 0 else { return }
     rawActive = 0
-    if let p = leaveBytes {
-        var off = 0
-        while off < leaveByteCount {
-            let n = write(STDOUT_FILENO, p + off, leaveByteCount - off)
-            if n < 0 { if errno == EINTR { continue }; break }
-            if n == 0 { break }
-            off += n
-        }
-    }
+    if let p = leaveBytes { writeAll(p, leaveByteCount) }
     tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
 }
 
@@ -999,6 +997,13 @@ private func collect(app: App, window: TimeInterval) -> (devices: [Device], star
     return (app.snapshotDevices(at: now()), start)
 }
 
+/// The `ts` format of every JSON object: ISO 8601 with milliseconds.
+private func makeTimestampFormatter() -> ISO8601DateFormatter {
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return iso
+}
+
 private func writeStderr(_ line: String) { FileHandle.standardError.write(Data((line + "\n").utf8)) }
 
 /// Report a headless outcome: its line on stderr and its exit status, or nothing when the
@@ -1015,8 +1020,7 @@ func runOnce(app: App, window: TimeInterval, json: Bool) {
     let t = now()   // after the scan, so the ages are measured from the moment of output
     if json {
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let ts = iso.string(from: Date())   // one stamp for the whole array: it is one snapshot
+        let ts = makeTimestampFormatter().string(from: Date())   // one stamp for the whole array: it is one snapshot
         let arr = devices.map { DeviceJSON($0, now: t, ts: ts, version: blescanVersion) }
         if let data = try? enc.encode(arr), let s = String(data: data, encoding: .utf8) { print(s) } else { print("[]") }
         // The array is printed first in every case: a cut-short scan still hands over what
@@ -1047,7 +1051,7 @@ func runStream(app: App, window: TimeInterval?) {
     app.wireRadio()
     app.radio.start()
     let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
-    let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let iso = makeTimestampFormatter()
     let start = now()
     var writtenAt: [String: Double] = [:]        // id → when we last wrote it
     var writtenSeen: [String: Double] = [:]      // id → the lastSeen that line carried
