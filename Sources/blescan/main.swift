@@ -982,12 +982,19 @@ func footerLines(_ cols: Int) -> [String] {
 
 /// Start the radio and block `window` seconds while the BLE queue accumulates devices,
 /// then return the snapshot and when the run started. The window also covers the
-/// adapter's ramp to poweredOn.
+/// adapter's ramp to poweredOn — but a state that cannot turn into a scan inside it ends
+/// the wait at once: permission denied (unauthorized) or no BLE at all (unsupported) used
+/// to hold `--json`, `--once` and `--diag` for the whole window before saying so.
+/// poweredOff keeps waiting: the power alert lets the user switch Bluetooth on mid-window.
 private func collect(app: App, window: TimeInterval) -> (devices: [Device], start: Double) {
     app.wireRadio()
     app.radio.start()
     let start = now()
-    Thread.sleep(forTimeInterval: window)
+    while now() - start < window {
+        let state = app.snapshotState()
+        if state == .unauthorized || state == .unsupported { break }
+        Thread.sleep(forTimeInterval: min(0.1, max(0, window - (now() - start))))
+    }
     app.radio.stop()
     return (app.snapshotDevices(at: now()), start)
 }
