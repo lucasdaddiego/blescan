@@ -459,6 +459,16 @@ let ibeaconBytes: [UInt8] =
     static func testLayout() {
         eq(charDisplayWidth("\u{0}"), 0, "null → 0 width")
         eq(charDisplayWidth("\u{0301}"), 0, "combining acute → 0")
+        // Combining marks outside U+0300–036F: a Thai vowel sign, a Devanagari sign, an
+        // enclosing circle, a lone VS16. Each is its own Character when nothing precedes it.
+        eq(charDisplayWidth("\u{0E31}"), 0, "Thai mai han-akat (Mn) → 0")
+        eq(charDisplayWidth("\u{0901}"), 0, "Devanagari candrabindu (Mn) → 0")
+        eq(charDisplayWidth("\u{20DD}"), 0, "combining enclosing circle (Me) → 0")
+        eq(charDisplayWidth("\u{FE0F}"), 0, "a lone VS16 has no base to promote → 0")
+        eq(displayWidth("\u{0E31}abc"), 3, "a name opening with a Thai mark measures what it paints")
+        eq(charDisplayWidth("é"), 1, "Latin-1 fast path → 1")
+        eq(charDisplayWidth("Ā"), 1, "Latin Extended fast path → 1")
+        eq(charDisplayWidth("\u{0391}"), 1, "Greek capital alpha (past the fast path, narrow) → 1")
         eq(charDisplayWidth("\u{200B}"), 0, "zero-width space → 0")
         eq(charDisplayWidth("\u{FEFF}"), 0, "BOM → 0")
         eq(charDisplayWidth("A"), 1, "ascii → 1")

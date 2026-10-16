@@ -899,35 +899,51 @@ func formatRate(_ perSecond: Double) -> String {
 // one Character, so padding by `.count` misaligns the table. These helpers measure and
 // truncate by display width instead.
 
+/// Wide / fullwidth scalar ranges (CJK, Hangul, fullwidth forms, emoji planes, flags).
+/// File scope, so charDisplayWidth — called per character of every cell of every frame —
+/// does not build this table on each call.
+private let wideRanges: [ClosedRange<UInt32>] = [
+    0x1100...0x115F, 0x2329...0x232A, 0x2E80...0x303E, 0x3041...0x33FF,
+    0x3400...0x4DBF, 0x4E00...0x9FFF, 0xA000...0xA4CF, 0xAC00...0xD7A3,
+    0xF900...0xFAFF, 0xFE10...0xFE19, 0xFE30...0xFE6F, 0xFF00...0xFF60,
+    0xFFE0...0xFFE6, 0x1F1E6...0x1F1FF, 0x1F300...0x1FAFF, 0x1F900...0x1F9FF,
+    0x20000...0x3FFFD,
+]
+
 /// Approximate East-Asian display width of a single Character (0/1/2 cells).
 func charDisplayWidth(_ c: Character) -> Int {
     let first = c.unicodeScalars.first!
     let v = first.value
     if v == 0 { return 0 }
-    if (0x0300...0x036F).contains(v) || (0x200B...0x200F).contains(v) || v == 0xFEFF { return 0 }
     // Measure the whole cluster, not just its base scalar: an emoji-presentation selector
-    // (VS16, U+FE0F) or an enclosing keycap mark (U+20E3) promotes a narrow base to a
-    // two-cell emoji glyph — "❤️" is U+2764 (narrow) + VS16, "1️⃣" is "1" + VS16 + keycap.
-    // Reading only the first scalar reported those as 1 column while terminals paint 2, so
-    // a name built from them overran the row budget and wrapped, tearing the frame. VS15
-    // (U+FE0E, text presentation) is deliberately absent: it keeps the glyph narrow.
-    if c.unicodeScalars.contains(where: { $0.value == 0xFE0F || $0.value == 0x20E3 }) { return 2 }
-    // The other half of that story: emoji whose DEFAULT presentation is already emoji
+    // (VS16, U+FE0F) or an enclosing keycap mark (U+20E3) AFTER the base promotes a narrow
+    // base to a two-cell emoji glyph — "❤️" is U+2764 (narrow) + VS16, "1️⃣" is "1" + VS16 +
+    // keycap. Reading only the first scalar reported those as 1 column while terminals paint
+    // 2, so a name built from them overran the row budget and wrapped, tearing the frame.
+    // VS15 (U+FE0E, text presentation) is deliberately absent: it keeps the glyph narrow.
+    // Checked before the fast path below, which would call "1️⃣" one cell.
+    if c.unicodeScalars.dropFirst().contains(where: { $0.value == 0xFE0F || $0.value == 0x20E3 }) { return 2 }
+    // Fast path: everything below U+0300 (ASCII, Latin-1, Latin Extended) is one cell — the
+    // first combining mark is U+0300 and the first wide range U+1100 — so most names skip
+    // the Unicode property lookups below.
+    if v < 0x300 { return 1 }
+    // Zero-width: a combining mark of ANY script (Mn / Me: accents, Thai and Devanagari
+    // vowel signs, Hebrew points, the variation selectors) plus the zero-width format
+    // scalars. Only U+0300–036F used to count, so a name opening with a Thai mark such as
+    // U+0E31 (its own Character: there is no base before it) measured 1 and painted 0,
+    // and every column to its right was drawn one cell left. A lone VS16 is Mn as well.
+    let cat = first.properties.generalCategory
+    if cat == .nonspacingMark || cat == .enclosingMark { return 0 }
+    if (0x200B...0x200F).contains(v) || v == 0xFEFF { return 0 }
+    // The other half of the emoji story: emoji whose DEFAULT presentation is already emoji
     // (✅ ❌ ⭐ ⌚ ⏰ …) carry no selector to spot them by, and they are scattered across
-    // blocks the hardcoded table below never listed — so a name of 13 ✅ measured 13 and
-    // painted 26, tearing the frame exactly like the VS16 case. Ask the Unicode data rather
-    // than trying to enumerate them: UAX #11 gives every Emoji_Presentation scalar
-    // East_Asian_Width=Wide, so this can only ever agree with a terminal — checked scalar by
-    // scalar against python-wcwidth, which it moves 86 characters towards and none away from.
+    // blocks the table above never listed — so a name of 13 ✅ measured 13 and painted 26,
+    // tearing the frame exactly like the VS16 case. Ask the Unicode data rather than trying
+    // to enumerate them: UAX #11 gives every Emoji_Presentation scalar East_Asian_Width=Wide,
+    // so this can only ever agree with a terminal — checked scalar by scalar against
+    // python-wcwidth, which it moves 86 characters towards and none away from.
     if first.properties.isEmojiPresentation { return 2 }
-    let wide: [ClosedRange<UInt32>] = [
-        0x1100...0x115F, 0x2329...0x232A, 0x2E80...0x303E, 0x3041...0x33FF,
-        0x3400...0x4DBF, 0x4E00...0x9FFF, 0xA000...0xA4CF, 0xAC00...0xD7A3,
-        0xF900...0xFAFF, 0xFE10...0xFE19, 0xFE30...0xFE6F, 0xFF00...0xFF60,
-        0xFFE0...0xFFE6, 0x1F1E6...0x1F1FF, 0x1F300...0x1FAFF, 0x1F900...0x1F9FF,
-        0x20000...0x3FFFD,
-    ]
-    for r in wide where r.contains(v) { return 2 }
+    for r in wideRanges where r.contains(v) { return 2 }
     return 1
 }
 
