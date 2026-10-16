@@ -865,10 +865,13 @@ struct AdvertRate {
     private var stamps: [Double] = []
     private var first: Double?
 
+    /// In place: the old `Array(stamps.drop …) + [t]` built two arrays per advert, under
+    /// the App lock, for every packet allow-duplicates delivers.
     mutating func record(at t: Double) {
         if first == nil { first = t }
         let cutoff = t - Self.window
-        stamps = Array(stamps.drop { $0 <= cutoff }) + [t]
+        stamps.removeFirst(stamps.prefix { $0 <= cutoff }.count)
+        stamps.append(t)
     }
 
     /// Adverts per second over the last `window` seconds — or, for a device first heard
