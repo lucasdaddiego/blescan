@@ -119,7 +119,7 @@ TUI — nothing to install, and nothing between you and the raw advert bytes.
 
 ## Requirements
 
-- **macOS** (built & tested on **macOS 26 / Apple Silicon**; targets macOS 12+).
+- **macOS** (built & tested on **macOS 26 and 27 / Apple Silicon**; targets macOS 12+).
 - **Xcode 16+ Command Line Tools** for `swiftc` — `xcode-select --install`. The code is
   in Swift 6 language mode, so a Swift 6 toolchain is required to build (running the
   binary needs only macOS 12+). `swift build` reads `Package.swift` (tools-version 6.3),
